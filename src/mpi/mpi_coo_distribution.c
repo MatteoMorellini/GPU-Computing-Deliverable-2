@@ -2,27 +2,81 @@
 #include <stdlib.h>
 #include "mpi_coo_distribution.h"
 
-static void compute_counts_and_displacements(int nnz, int size,
-                                             int *counts, int *displs) {
-    int base = nnz / size;
-    int remainder = nnz % size;
+static void compute_displacements(int size, const int *counts, int *displs) {
     int offset = 0;
 
-    /*
-     * Split the global COO entries as evenly as possible.
-     *
-     * Example: nnz = 10, size = 4
-     *   counts = [3, 3, 2, 2]
-     *   displs = [0, 3, 6, 8]
-     *
-     * counts[rank] tells MPI how many entries that rank receives.
-     * displs[rank] tells MPI where that rank's slice starts in the root array.
-     */
     for (int rank = 0; rank < size; rank++) {
-        counts[rank] = base + (rank < remainder ? 1 : 0);
         displs[rank] = offset;
         offset += counts[rank];
     }
+}
+
+static int build_cyclic_send_buffers(const COO_Matrix *global_matrix,
+                                     int size,
+                                     int **counts_out,
+                                     int **displs_out,
+                                     int **rows_out,
+                                     int **cols_out,
+                                     double **data_out) {
+    int *counts = calloc((size_t)size, sizeof(int));
+    int *displs = malloc((size_t)size * sizeof(int));
+    int *next = NULL;
+    int *rows = NULL;
+    int *cols = NULL;
+    double *data = NULL;
+
+    if (!counts || !displs) {
+        goto error;
+    }
+
+    for (int i = 0; i < global_matrix->nnz; i++) {
+        int owner = global_matrix->row[i] % size;
+        counts[owner]++;
+    }
+
+    compute_displacements(size, counts, displs);
+
+    if (global_matrix->nnz > 0) {
+        rows = malloc((size_t)global_matrix->nnz * sizeof(int));
+        cols = malloc((size_t)global_matrix->nnz * sizeof(int));
+        data = malloc((size_t)global_matrix->nnz * sizeof(double));
+        next = malloc((size_t)size * sizeof(int));
+        if (!rows || !cols || !data || !next) {
+            goto error;
+        }
+    }
+
+    if (next) {
+        for (int rank = 0; rank < size; rank++) {
+            next[rank] = displs[rank];
+        }
+    }
+
+    for (int i = 0; i < global_matrix->nnz; i++) {
+        int owner = global_matrix->row[i] % size;
+        int dest = next[owner]++;
+
+        rows[dest] = global_matrix->row[i];
+        cols[dest] = global_matrix->col[i];
+        data[dest] = global_matrix->data[i];
+    }
+
+    free(next);
+    *counts_out = counts;
+    *displs_out = displs;
+    *rows_out = rows;
+    *cols_out = cols;
+    *data_out = data;
+    return 0;
+
+error:
+    free(counts);
+    free(displs);
+    free(next);
+    free(rows);
+    free(cols);
+    free(data);
+    return 1;
 }
 
 static int allocate_local_entries(LocalCOO_Matrix *mat) {
@@ -90,9 +144,9 @@ int distribute_coo_entries(const COO_Matrix *global_matrix,
      * Rank 0 is the only process that reads the Matrix Market file.
      *
      * The other ranks still need the global shape and nnz:
-     *   - nnz is needed to compute the balanced entry partition;
-     *   - rows and cols describe the global matrix that each local slice
-     *     belongs to;
+     *   - rows and cols describe the global matrix that each local row-cyclic
+     *     slice belongs to;
+     *   - nnz is used to verify the final distributed entry count;
      *   - later distributed operations, such as SpMV, need the global
      *     dimensions to allocate input/output vectors correctly.
      *
@@ -108,34 +162,32 @@ int distribute_coo_entries(const COO_Matrix *global_matrix,
     local_matrix->col = NULL;
     local_matrix->data = NULL;
 
-    int *counts = malloc((size_t)size * sizeof(int));
-    /* counts[i] = number of entries for rank i */
-    int *displs = malloc((size_t)size * sizeof(int));
-    /* displs[i] = starting index of entries for rank i */
-    /* eg global entries: 0 1 2 3 4 5 6 7 8 9 10
-       rank 0 gets: 0 1 2  rank 1 gets: 3 4 5 ...
-       counts = [3, 3, 2, 2] displs = [0, 3, 6, 8]
-    */
+    int *counts = NULL;
+    int *displs = NULL;
+    int *send_rows_buffer = NULL;
+    int *send_cols_buffer = NULL;
+    double *send_data_buffer = NULL;
 
-    // check whether either allocation failed
-    local_error = (!counts || !displs);
+    if (rank == root) {
+        local_error = build_cyclic_send_buffers(global_matrix, size, &counts,
+                                                &displs, &send_rows_buffer,
+                                                &send_cols_buffer,
+                                                &send_data_buffer);
+    }
 
     MPI_Allreduce(&local_error, &any_error, 1, MPI_INT, MPI_MAX, comm);
     if (any_error) {
         free(counts);
         free(displs);
+        free(send_rows_buffer);
+        free(send_cols_buffer);
+        free(send_data_buffer);
         return 1;
     }
-    
-    /*
-        Every rank computes the full counts and displs array
-        Only the root rank actually uses counts and displs to decide 
-        what to send to each process. But the function signature is
-        collective, so every rank calls it with those parameters
-    */
-    compute_counts_and_displacements(local_matrix->global_nnz, size, counts, displs);
-    local_matrix->local_nnz = counts[rank];
-    local_matrix->global_offset = displs[rank];
+
+    MPI_Scatter(counts, 1, MPI_INT, &local_matrix->local_nnz, 1, MPI_INT,
+                root, comm);
+    local_matrix->global_offset = -1;
 
     // allocate this rank's local COO arrays
     local_error = allocate_local_entries(local_matrix);
@@ -144,27 +196,24 @@ int distribute_coo_entries(const COO_Matrix *global_matrix,
     if (any_error) {
         free(counts);
         free(displs);
+        free(send_rows_buffer);
+        free(send_cols_buffer);
+        free(send_data_buffer);
         return 1;
     }
 
-    // if this process is the root, prepare the send buffers for MPI_Scatterv, else NULL
-    const int *send_rows = rank == root ? global_matrix->row : NULL;
-    const int *send_cols = rank == root ? global_matrix->col : NULL;
-    const double *send_data = rank == root ? global_matrix->data : NULL;
+    const int *send_rows = rank == root ? send_rows_buffer : NULL;
+    const int *send_cols = rank == root ? send_cols_buffer : NULL;
+    const double *send_data = rank == root ? send_data_buffer : NULL;
 
     /*
-     * Use MPI_Scatterv instead of MPI_Scatter because nnz is not guaranteed to
-     * be divisible by the number of processes. Different ranks may receive
-     * different local_nnz values.
+     * Use 1D modulo row ownership:
      *
-     * COO stores one matrix entry across three parallel arrays:
-     *   row[i], col[i], data[i]
+     *   owner(row) = row % number_of_processes
      *
-     * Scattering the same interval from all three arrays preserves valid
-     * (row, col, value) triples on each rank.
-     * 
-     * Each rank receives its local_nnz entries from the global arrays, starting
-     * at the global_offset index, into local_matrix->row ...
+     * Rank 0 first groups COO triples by owner, preserving the original global
+     * row index inside each triple. MPI_Scatterv then sends each rank all
+     * nonzeros for its owned rows.
      */
 
     MPI_Scatterv(send_rows, counts, displs, MPI_INT,
@@ -179,6 +228,9 @@ int distribute_coo_entries(const COO_Matrix *global_matrix,
 
     free(counts);
     free(displs);
+    free(send_rows_buffer);
+    free(send_cols_buffer);
+    free(send_data_buffer);
     return 0;
 }
 

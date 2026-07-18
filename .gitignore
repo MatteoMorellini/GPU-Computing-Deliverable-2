@@ -2,7 +2,8 @@
 .DS_Store
 bin/
 build/
-matrices/
+matrices/*
+!matrices/tiny.mtx
 .venv/
 *.o
 *.exe

@@ -15,19 +15,27 @@ typedef struct {
     /* Number of COO entries owned by this rank. */
     int local_nnz;
 
-    /* First global COO entry index owned by this rank. */
+    /* Unused for cyclic row distribution. */
     int global_offset;
 
-    /* Local slices of the global COO row, column, and value arrays. */
+    /* Local COO triples for rows where row % number_of_processes == rank. */
     int *row;
     int *col;
     double *data;
 } LocalCOO_Matrix;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 int distribute_coo_entries(const COO_Matrix *global_matrix,
                            LocalCOO_Matrix *local_matrix,
                            int root,
                            MPI_Comm comm);
 void free_local_coo(LocalCOO_Matrix *mat);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

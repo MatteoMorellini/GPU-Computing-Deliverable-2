@@ -6,11 +6,8 @@
 #include "mtx_reader.h"
 
 static void print_local_summary(const LocalCOO_Matrix *local, int rank, int size) {
-    int begin = local->global_offset;
-    int end = begin + local->local_nnz;
-
-    printf("Rank %d/%d received %d entries: global COO interval [%d, %d)\n",
-           rank, size, local->local_nnz, begin, end);
+    printf("Rank %d/%d owns rows i where i %% %d == %d and received %d entries\n",
+           rank, size, size, rank, local->local_nnz);
 
     if (local->local_nnz > 0) {
         int first = 0;
@@ -50,6 +47,7 @@ int main(int argc, char **argv) {
                argv[1], global.rows, global.cols, global.nnz, read_seconds);
     }
 
+    // all ranks wait until rank 0 has finished reading
     MPI_Barrier(MPI_COMM_WORLD);
     double scatter_start = MPI_Wtime();
 
@@ -65,6 +63,8 @@ int main(int argc, char **argv) {
     double scatter_seconds = MPI_Wtime() - scatter_start;
 
     int total_distributed = 0;
+    // Sum the number of distributed entries across all ranks
+    // check that it matches the global nnz count
     MPI_Reduce(&local.local_nnz, &total_distributed, 1, MPI_INT, MPI_SUM, 0,
                MPI_COMM_WORLD);
 
