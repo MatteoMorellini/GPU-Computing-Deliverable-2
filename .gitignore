@@ -1,0 +1,15 @@
+.history
+.DS_Store
+bin/
+build/
+matrices/
+.venv/
+*.o
+*.exe
+dummy/
+matrices.txt
+images/
+ncus/
+*.out
+*.err
+nsys/
