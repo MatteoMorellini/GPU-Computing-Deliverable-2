@@ -29,6 +29,7 @@ results.
 From this directory:
 
 ```bash
+module load CUDA/12.3.2
 module load OpenMpi/4.1.5-CUDA-12.3.2
 make
 ```
@@ -48,25 +49,32 @@ If your environment exposes a different MPI module, load the one that provides
 
 ## Run
 
-Smoke test with the included matrix:
+Distribution-only check for every `.mtx` file in `matrices/`:
 
 ```bash
+module load CUDA/12.3.2
 module load OpenMpi/4.1.5-CUDA-12.3.2
-mpirun -np 4 ./bin/mpi_spmv_cuda matrices/tiny.mtx --kernel scalar
+mpirun -np 4 ./bin/distribute_mtx
 ```
 
-On Slurm:
+Run the MPI SpMV benchmark across every `.mtx` file in `matrices/`:
 
 ```bash
-sbatch MPI_run.sh matrices/tiny.mtx scalar
+module load CUDA/12.3.2
+module load OpenMpi/4.1.5-CUDA-12.3.2
+mpirun -np 4 ./bin/mpi_spmv_cuda --kernel scalar
+```
+
+On Slurm, the run script requests two NVIDIA A30 GPUs to match deliverable 1's
+GPU type. It runs every `.mtx` file in `matrices/` and writes
+`results/mpi_spmv.csv`:
+
+```bash
+sbatch MPI_run.sh
 ```
 
 For the larger matrices from deliverable 1, either copy or symlink them into
-`matrices/`, then pass the desired `.mtx` path:
-
-```bash
-mpirun -np 4 ./bin/mpi_spmv_cuda matrices/ASIC_680ks.mtx --kernel adaptive
-```
+`matrices/` before running the executable.
 
 Available kernels:
 
@@ -86,9 +94,9 @@ matrix and print one timing/checksum block per implementation.
 Benchmark controls:
 
 ```bash
-mpirun -np 4 ./bin/mpi_spmv_cuda matrices/tiny.mtx --kernel all --reps 100 --warmup 5
-mpirun -np 4 ./bin/mpi_spmv_cuda matrices/tiny.mtx --kernel vector --output results/my_run.csv
-sbatch MPI_run.sh matrices/tiny.mtx vector 100 5
+mpirun -np 4 ./bin/mpi_spmv_cuda --kernel all --reps 100 --warmup 5
+mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --output results/my_run.csv
+sbatch MPI_run.sh vector 100 5
 ```
 
 The default CSV output is:
@@ -97,11 +105,14 @@ The default CSV output is:
 results/mpi_spmv.csv
 ```
 
+Repeated runs append rows to the CSV. The header is written only when the file
+does not exist yet or is empty.
+
 It uses the same metric columns as deliverable 1:
 
 ```text
 implementation,format,matrix,rows,cols,nnz,
-avg_time_s,std_time_s,gflops,
+processes,avg_time_s,std_time_s,gflops,
 file_parse_s,format_conv_s,h2d_transfer_s,
 valid,max_abs_error
 ```

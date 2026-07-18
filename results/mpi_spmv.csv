@@ -1,0 +1,3 @@
+implementation,format,matrix,rows,cols,nnz,processes,avg_time_s,std_time_s,gflops,file_parse_s,format_conv_s,h2d_transfer_s,valid,max_abs_error
+MPI adaptive,CSR,ldoor.mtx,952203,952203,46522475,1,7.548825634e-04,8.772224292e-07,123.257516489,6.196491223e+00,3.669131535e-01,3.317155600e-02,0,1.997471085e+01
+MPI adaptive,CSR,webbase-1M.mtx,1000005,1000005,3105536,1,9.676800296e-05,7.168002427e-07,64.185183224,6.911066020e-01,3.349431531e-02,3.034462000e-03,1,2.022539686e-06

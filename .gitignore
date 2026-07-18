@@ -3,7 +3,6 @@
 bin/
 build/
 matrices/*
-!matrices/tiny.mtx
 .venv/
 *.o
 *.exe

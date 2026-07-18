@@ -17,6 +17,7 @@ LIB_SRC = src/io/mtx_reader.c \
 DISTRIBUTE_MAIN_SRC = src/mpi/distribute_mtx.c
 SPMV_CUDA_SRC = src/mpi/spmv_mpi_cuda.cu \
                 src/kernels/spmv_kernel_runners.cu
+HEADERS = $(wildcard include/*.h include/*.cuh)
 
 LIB_OBJ = $(LIB_SRC:.c=.o)
 DISTRIBUTE_MAIN_OBJ = $(DISTRIBUTE_MAIN_SRC:.c=.o)
@@ -26,13 +27,13 @@ all: $(DISTRIBUTE_TARGET) $(SPMV_TARGET)
 bin:
 	mkdir -p bin
 
-%.o: %.c
+%.o: %.c $(HEADERS)
 	$(MPICC) $(CFLAGS) -c $< -o $@
 
 $(DISTRIBUTE_TARGET): $(LIB_OBJ) $(DISTRIBUTE_MAIN_OBJ) | bin
 	$(MPICC) $(CFLAGS) $(LIB_OBJ) $(DISTRIBUTE_MAIN_OBJ) -o $@
 
-$(SPMV_TARGET): $(LIB_OBJ) $(SPMV_CUDA_SRC) | bin
+$(SPMV_TARGET): $(LIB_OBJ) $(SPMV_CUDA_SRC) $(HEADERS) | bin
 	$(NVCC) $(NVCCFLAGS) -ccbin $(MPICXX) $(SPMV_CUDA_SRC) $(LIB_OBJ) -o $@ -lcusparse
 
 clean:

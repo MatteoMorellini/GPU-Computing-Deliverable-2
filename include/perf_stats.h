@@ -23,6 +23,7 @@ typedef struct {
     int rows;                  // Number of matrix rows (size of output vector y)
     int cols;                  // Number of matrix columns (size of input vector x)
     int nnz;                   // Total number of nonzero elements (dominant factor in SpMV cost)
+    int processes;             // Number of MPI processes used for the distributed run
 
     // -------------------------------------------------------
     // PERFORMANCE METRICS
@@ -71,19 +72,25 @@ static inline const char *perf_stats_resolve_path(const char *default_path) {
     return (env && env[0]) ? env : default_path;
 }
 
-// Open the CSV file in write mode and emit the header. Returns NULL on failure.
+// Open the CSV file in append mode and emit the header only for a new file.
 // Creates parent directory "results/" if needed.
 static inline FILE *perf_stats_open_csv(const char *path) {
     mkdir("results", 0755); // ignore EEXIST
-    FILE *f = fopen(path, "w");
+
+    struct stat st;
+    int write_header = stat(path, &st) != 0 || st.st_size == 0;
+
+    FILE *f = fopen(path, "a");
     if (!f) {
         fprintf(stderr, "Error: could not open results CSV '%s'\n", path);
         return NULL;
     }
-    fprintf(f, "implementation,format,matrix,rows,cols,nnz,"
-               "avg_time_s,std_time_s,gflops,"
-               "file_parse_s,format_conv_s,h2d_transfer_s,"
-               "valid,max_abs_error\n");
+    if (write_header) {
+        fprintf(f, "implementation,format,matrix,rows,cols,nnz,processes,"
+                   "avg_time_s,std_time_s,gflops,"
+                   "file_parse_s,format_conv_s,h2d_transfer_s,"
+                   "valid,max_abs_error\n");
+    }
     return f;
 }
 
@@ -91,9 +98,9 @@ static inline FILE *perf_stats_open_csv(const char *path) {
 // safe to read between runs of different executables.
 static inline void perf_stats_write_csv_row(FILE *f, const PerfStats *s) {
     if (!f || !s) return;
-    fprintf(f, "%s,%s,%s,%d,%d,%d,%.9e,%.9e,%.9f,%.9e,%.9e,%.9e,%d,%.9e\n",
+    fprintf(f, "%s,%s,%s,%d,%d,%d,%d,%.9e,%.9e,%.9f,%.9e,%.9e,%.9e,%d,%.9e\n",
             s->implementation, s->format, s->name,
-            s->rows, s->cols, s->nnz,
+            s->rows, s->cols, s->nnz, s->processes,
             s->avg_time_s, s->std_time_s, s->gflops,
             s->file_parse_s, s->format_conv_s, s->h2d_transfer_s,
             s->valid, s->max_abs_error);

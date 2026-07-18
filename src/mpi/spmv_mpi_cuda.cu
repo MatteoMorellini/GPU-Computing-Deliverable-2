@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <mpi.h>
 
+#include <dirent.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,10 @@
 
 #ifndef BENCH_WARMUP
 #define BENCH_WARMUP 5
+#endif
+
+#ifndef BENCH_MATRICES_DIR
+#define BENCH_MATRICES_DIR "./matrices/"
 #endif
 
 static void check_cuda(cudaError_t status,
@@ -107,6 +112,11 @@ static const char *matrix_basename(const char *path) {
     return slash ? slash + 1 : path;
 }
 
+static int has_mtx_extension(const char *name) {
+    const char *ext = strrchr(name, '.');
+    return ext && strcmp(ext, ".mtx") == 0;
+}
+
 static void reduce_kernel_times(const double *times,
                                 int n,
                                 int nnz,
@@ -169,31 +179,25 @@ static void validate_vs_reference(const CSR_Matrix *csr,
 
 static void print_usage(const char *program, FILE *stream) {
     fprintf(stream,
-            "Usage: %s <matrix-market-file.mtx> [--kernel <name>] "
-            "[--reps N] [--warmup N] [--output path]\n",
-            program);
+            "Usage: %s [--kernel <name>] [--reps N] [--warmup N] "
+            "[--output path]\n"
+            "Runs every .mtx file in %s.\n",
+            program, BENCH_MATRICES_DIR);
     print_spmv_kernel_choices(stream);
 }
 
 static int parse_args(int argc,
                       char **argv,
-                      const char **matrix_path,
                       const char **kernel_name,
                       int *reps,
                       int *warmup,
                       const char **csv_path) {
-    *matrix_path = NULL;
     *kernel_name = "scalar";
     *reps = BENCH_REPS;
     *warmup = BENCH_WARMUP;
     *csv_path = "results/mpi_spmv.csv";
 
-    if (argc < 2) {
-        return 1;
-    }
-
-    *matrix_path = argv[1];
-    for (int i = 2; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--kernel") == 0) {
             if (i + 1 >= argc) {
                 return 1;
@@ -421,6 +425,7 @@ static void execute_kernel(SpmvKernelKind kind,
         stats.rows = global_rows;
         stats.cols = global_cols;
         stats.nnz = global_nnz;
+        stats.processes = size;
         stats.file_parse_s = file_parse_seconds;
         stats.format_conv_s = max_convert_seconds + max_prep_seconds;
         stats.h2d_transfer_s = max_h2d_seconds;
@@ -453,70 +458,20 @@ static void execute_kernel(SpmvKernelKind kind,
     free(kernel_times);
 }
 
-int main(int argc, char **argv) {
-    MPI_Init(&argc, &argv);
-
-    int rank;
-    int size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    const char *matrix_path = NULL;
-    const char *kernel_name = NULL;
-    const char *csv_path = NULL;
-    int reps = 0;
-    int warmup = 0;
-    if (parse_args(argc, argv, &matrix_path, &kernel_name, &reps, &warmup,
-                   &csv_path) != 0) {
-        if (rank == 0) {
-            print_usage(argv[0], stderr);
-        }
-        MPI_Finalize();
-        return 1;
-    }
-
-    SpmvKernelKind kernel_kinds[SPMV_KERNEL_CUSPARSE + 1];
-    int kernel_count = 0;
-    if (strcmp(kernel_name, "all") == 0) {
-        for (int i = 0; i <= SPMV_KERNEL_CUSPARSE; i++) {
-            kernel_kinds[kernel_count++] = (SpmvKernelKind)i;
-        }
-    } else {
-        if (parse_spmv_kernel_kind(kernel_name, &kernel_kinds[0]) != 0) {
-            if (rank == 0) {
-                fprintf(stderr, "Unknown kernel: %s\n", kernel_name);
-                print_spmv_kernel_choices(stderr);
-            }
-            MPI_Finalize();
-            return 1;
-        }
-        kernel_count = 1;
-    }
-
-    FILE *csv = NULL;
-    int csv_error = 0;
-    if (rank == 0) {
-        csv = perf_stats_open_csv(perf_stats_resolve_path(csv_path));
-        csv_error = csv == NULL;
-    }
-    int any_error = 0;
-    MPI_Allreduce(&csv_error, &any_error, 1, MPI_INT, MPI_MAX,
-                  MPI_COMM_WORLD);
-    if (any_error) {
-        MPI_Finalize();
-        return 1;
-    }
-
-    int device_count = 0;
-    CHECK_CUDA(cudaGetDeviceCount(&device_count), rank);
-    if (device_count <= 0) {
-        abort_all("No CUDA devices available", rank);
-    }
-    CHECK_CUDA(cudaSetDevice(rank % device_count), rank);
-
+static int run_matrix(const char *matrix_path,
+                      const SpmvKernelKind *kernel_kinds,
+                      int kernel_count,
+                      const char *kernel_name,
+                      int reps,
+                      int warmup,
+                      FILE *csv,
+                      const char *csv_path,
+                      int rank,
+                      int size) {
     COO_Matrix global = {0};
     CSR_Matrix reference_csr = {0};
     double read_seconds = 0.0;
+    int any_error = 0;
 
     if (rank == 0) {
         double read_start = MPI_Wtime();
@@ -661,11 +616,141 @@ int main(int argc, char **argv) {
     free(gathered_y);
     free_local_coo(&local);
     if (rank == 0) {
-        fclose(csv);
         free_csr(&reference_csr);
         free_coo(&global);
     }
 
-    MPI_Finalize();
     return 0;
+}
+
+int main(int argc, char **argv) {
+    MPI_Init(&argc, &argv);
+
+    int rank;
+    int size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    const char *kernel_name = NULL;
+    const char *csv_path = NULL;
+    int reps = 0;
+    int warmup = 0;
+    if (parse_args(argc, argv, &kernel_name, &reps, &warmup, &csv_path) != 0) {
+        if (rank == 0) {
+            print_usage(argv[0], stderr);
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    SpmvKernelKind kernel_kinds[SPMV_KERNEL_CUSPARSE + 1];
+    int kernel_count = 0;
+    if (strcmp(kernel_name, "all") == 0) {
+        for (int i = 0; i <= SPMV_KERNEL_CUSPARSE; i++) {
+            kernel_kinds[kernel_count++] = (SpmvKernelKind)i;
+        }
+    } else {
+        if (parse_spmv_kernel_kind(kernel_name, &kernel_kinds[0]) != 0) {
+            if (rank == 0) {
+                fprintf(stderr, "Unknown kernel: %s\n", kernel_name);
+                print_spmv_kernel_choices(stderr);
+            }
+            MPI_Finalize();
+            return 1;
+        }
+        kernel_count = 1;
+    }
+
+    FILE *csv = NULL;
+    int csv_error = 0;
+    if (rank == 0) {
+        csv = perf_stats_open_csv(perf_stats_resolve_path(csv_path));
+        csv_error = csv == NULL;
+    }
+    int any_error = 0;
+    MPI_Allreduce(&csv_error, &any_error, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    if (any_error) {
+        MPI_Finalize();
+        return 1;
+    }
+
+    int device_count = 0;
+    CHECK_CUDA(cudaGetDeviceCount(&device_count), rank);
+    if (device_count <= 0) {
+        abort_all("No CUDA devices available", rank);
+    }
+    CHECK_CUDA(cudaSetDevice(rank % device_count), rank);
+
+    DIR *dir = NULL;
+    int dir_error = 0;
+    if (rank == 0) {
+        dir = opendir(BENCH_MATRICES_DIR);
+        if (!dir) {
+            fprintf(stderr, "Error opening directory %s\n", BENCH_MATRICES_DIR);
+            dir_error = 1;
+        } else {
+            printf("Files in %s:\n", BENCH_MATRICES_DIR);
+        }
+    }
+    MPI_Allreduce(&dir_error, &any_error, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    if (any_error) {
+        if (rank == 0) {
+            fclose(csv);
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    int found_matrix = 0;
+    int status = 0;
+    while (1) {
+        int has_matrix = 0;
+        char matrix_path[1024] = {0};
+
+        if (rank == 0) {
+            struct dirent *entry = NULL;
+            while ((entry = readdir(dir)) != NULL) {
+                if (entry->d_name[0] == '.') {
+                    continue;
+                }
+                if (!has_mtx_extension(entry->d_name)) {
+                    continue;
+                }
+
+                snprintf(matrix_path, sizeof(matrix_path), "%s%s",
+                         BENCH_MATRICES_DIR, entry->d_name);
+                has_matrix = 1;
+                found_matrix = 1;
+                break;
+            }
+        }
+
+        MPI_Bcast(&has_matrix, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (!has_matrix) {
+            break;
+        }
+
+        MPI_Bcast(matrix_path, sizeof(matrix_path), MPI_CHAR, 0,
+                  MPI_COMM_WORLD);
+        if (run_matrix(matrix_path, kernel_kinds, kernel_count, kernel_name,
+                       reps, warmup, csv, csv_path, rank, size) != 0) {
+            status = 1;
+            break;
+        }
+    }
+
+    if (rank == 0) {
+        closedir(dir);
+        if (!found_matrix) {
+            fprintf(stderr, "No .mtx files found in %s\n", BENCH_MATRICES_DIR);
+            status = 1;
+        }
+        fclose(csv);
+    }
+
+    MPI_Bcast(&status, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Finalize();
+    return status;
 }
