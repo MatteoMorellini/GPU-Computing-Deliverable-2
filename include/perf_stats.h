@@ -30,10 +30,14 @@ typedef struct {
     // These quantify runtime stability and computational throughput.
     // -------------------------------------------------------
 
-    double avg_time_s;         // Average execution time of SpMV kernel (excluding preprocessing)
+    double avg_time_s;         // Average execution time of one SpMV iteration (communication + local compute)
 
     double std_time_s;         // Runtime variability across repetitions; indicates stability of memory behavior
                                // and sensitivity to cache / OS scheduling effects
+
+    double comm_time_s;        // Average per-iteration MPI ghost-vector exchange time
+
+    double compute_time_s;     // Average per-iteration local CUDA SpMV kernel time
 
     // -------------------------------------------------------
     // COMPUTATIONAL THROUGHPUT
@@ -52,8 +56,8 @@ typedef struct {
                                // algorithm-specific host preprocessing
                                // (row_blocks, batches, cuSPARSE descriptors)
 
-    double h2d_transfer_s;     // Time to allocate + copy CSR arrays
-                               // (row_ptr, col_idx, values) to the device
+    double h2d_transfer_s;     // Time to allocate + copy CSR arrays and compact owned x
+                               // values to the device
 
     // -------------------------------------------------------
     // VALIDATION METRICS
@@ -88,6 +92,7 @@ static inline FILE *perf_stats_open_csv(const char *path) {
     if (write_header) {
         fprintf(f, "implementation,format,matrix,rows,cols,nnz,processes,"
                    "avg_time_s,std_time_s,gflops,"
+                   "comm_time_s,compute_time_s,"
                    "file_parse_s,format_conv_s,h2d_transfer_s,"
                    "valid,max_abs_error\n");
     }
@@ -98,10 +103,11 @@ static inline FILE *perf_stats_open_csv(const char *path) {
 // safe to read between runs of different executables.
 static inline void perf_stats_write_csv_row(FILE *f, const PerfStats *s) {
     if (!f || !s) return;
-    fprintf(f, "%s,%s,%s,%d,%d,%d,%d,%.9e,%.9e,%.9f,%.9e,%.9e,%.9e,%d,%.9e\n",
+    fprintf(f, "%s,%s,%s,%d,%d,%d,%d,%.9e,%.9e,%.9f,%.9e,%.9e,%.9e,%.9e,%.9e,%d,%.9e\n",
             s->implementation, s->format, s->name,
             s->rows, s->cols, s->nnz, s->processes,
             s->avg_time_s, s->std_time_s, s->gflops,
+            s->comm_time_s, s->compute_time_s,
             s->file_parse_s, s->format_conv_s, s->h2d_transfer_s,
             s->valid, s->max_abs_error);
     fflush(f);

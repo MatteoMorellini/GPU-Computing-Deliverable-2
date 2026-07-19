@@ -96,8 +96,16 @@ Benchmark controls:
 ```bash
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel all --reps 100 --warmup 5
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --output results/my_run.csv
+mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --cuda-aware-mpi
 sbatch MPI_run.sh vector 100 5
 ```
+
+By default, MPI communication uses host buffers. Pass `--cuda-aware-mpi` only
+when the loaded MPI implementation supports CUDA device pointers. In
+distributed-x mode, this packs outgoing ghost values on the GPU and receives
+incoming values directly into the compact device vector. The final result
+gather also communicates device buffers directly. An MPI implementation without
+CUDA-aware support may fail when this flag is enabled.
 
 The default CSV output is:
 
@@ -157,4 +165,6 @@ local row  = global row / P
 
 The CUDA kernel computes only those local rows. Rank 0 gathers local `y` chunks
 with `MPI_Gatherv` and reconstructs the global vector by placing each gathered
-value back at `rank + local_row * P`.
+value back at `rank + local_row * P`. With `--cuda-aware-mpi`, the gather uses
+device send and receive buffers before rank 0 copies the gathered values to the
+host for reconstruction and validation.
