@@ -1,17 +1,17 @@
 # GPU Computing - Deliverable 2: MPI Multi-GPU SpMV
 
-Rank 0 reads the complete Matrix Market file in COO format and distributes rows
-with 1D modulo cyclic ownership. Each rank receives COO entries for rows
-`owner(i) = i mod P`, converts those entries to CSR, computes its part of the
-sparse matrix-vector product on one CUDA GPU, and rank 0 merges the owned row
-results.
+Matrix Market input can be loaded entirely by rank 0 and scattered, or read in
+parallel as disjoint per-rank byte chunks. Parsed COO entries are routed to their
+row owner, converted to local CSR, and processed on one CUDA GPU. The benchmark
+supports replicated dense vectors, cyclically distributed vectors, and a third
+balanced block-distributed mode.
 
 **Author:** Matteo Morellini (268427) - University of Trento
 
 ## Layout
 
-- `include/mtx_reader.h`, `src/io/mtx_reader.c` - same COO Matrix Market reader
-  interface used in deliverable 1.
+- `include/mtx_reader.h`, `src/io/mtx_reader.c` - the deliverable 1 reader plus
+  a byte-range reader used for parallel file input.
 - `include/coo_to_csr.h`, `src/io/coo_to_csr.c` - COO to CSR conversion copied
   from deliverable 1.
 - `include/generate_dense.h`, `src/io/generate_dense.c` - dense input vector
@@ -55,6 +55,10 @@ Distribution-only check for every `.mtx` file in `matrices/`:
 module load CUDA/12.3.2
 module load OpenMpi/4.1.5-CUDA-12.3.2
 mpirun -np 4 ./bin/distribute_mtx
+mpirun -np 4 ./bin/distribute_mtx --input-mode root
+mpirun -np 4 ./bin/distribute_mtx --partition block
+mpirun -np 4 ./bin/distribute_mtx --partition block \
+  --matrix dummy_matrix/tiny.mtx
 ```
 
 Run the MPI SpMV benchmark across every `.mtx` file in `matrices/`:
@@ -72,6 +76,18 @@ GPU type. It runs every `.mtx` file in `matrices/` and writes
 ```bash
 sbatch MPI_run.sh
 ```
+
+To test whether Open MPI can select the same-node CUDA IPC path, run:
+
+```bash
+sbatch MPI_run.sh --cuda-ipc-test
+```
+
+The probe forces the `smcuda` transport so that it cannot silently fall back to
+TCP, enables CUDA IPC diagnostics, and runs a generated two-rank ghost exchange.
+It writes the verbose transport trace to
+`results/cuda_ipc_probe_<job-id>.log` and reports `AVAILABLE`, `FAILED`, or
+`INCONCLUSIVE`.
 
 For the larger matrices from deliverable 1, either copy or symlink them into
 `matrices/` before running the executable.
@@ -97,8 +113,24 @@ Benchmark controls:
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel all --reps 100 --warmup 5
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --output results/my_run.csv
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --cuda-aware-mpi
+mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --x-mode block
+mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --input-mode root
 sbatch MPI_run.sh vector 100 5
 ```
+
+Matrix input is selected independently from dense-vector ownership:
+
+- `--input-mode distributed` (default): every rank parses a disjoint file
+  chunk, then entries are exchanged with their row owners.
+- `--input-mode root`: rank 0 reads the complete file with the original reader,
+  groups entries by row owner, and distributes them with `MPI_Scatterv`.
+
+Dense-vector ownership modes are:
+
+- `--x-mode replicated`: every process stores the complete dense vector.
+- `--x-mode cyclic` (also `distributed` or `dist`): `owner(j) = j mod P`.
+- `--x-mode block`: rank `r` owns one balanced contiguous interval of vector
+  entries. Matrix rows use the matching block partition.
 
 By default, MPI communication uses host buffers. Pass `--cuda-aware-mpi` only
 when the loaded MPI implementation supports CUDA device pointers. In
@@ -135,36 +167,49 @@ column for it.
 
 ## Distribution Strategy
 
-Rank 0 reads the full `.mtx` file into a `COO_Matrix`. The metadata `rows`,
-`cols`, and `nnz` is broadcast to every process. Rows are assigned cyclically:
+With `--input-mode distributed`, each rank opens the same `.mtx` file, reads the
+header, and parses only its balanced byte range of the data section. A rank that
+starts in the middle of a text line advances to the next line, while the
+preceding rank finishes that line. This makes every stored Matrix Market entry
+belong to exactly one reader. Pattern and symmetric inputs retain the behavior
+of the serial reader, including off-diagonal expansion.
+
+Parsed entries are sent with `MPI_Alltoallv` to the selected row owner. With
+`--input-mode root`, rank 0 instead uses the original full-file reader and sends
+the grouped entries with `MPI_Scatterv`. The default row assignment remains
+cyclic:
 
 ```text
 owner(i) = i mod P
 ```
 
 where `P` is the number of MPI processes and `i` is the zero-based global row
-index. Rank 0 groups COO triples by `owner(row)` and scatters three arrays with
-`MPI_Scatterv`:
+index. Block mode instead assigns balanced contiguous row intervals. In both
+cases ranks exchange three arrays:
 
 - `row`
 - `col`
 - `data`
 
 Each rank receives a `LocalCOO_Matrix` containing all nonzeros for its owned
-cyclic rows plus the global matrix dimensions and global `nnz`.
+rows plus the global matrix dimensions and global `nnz`. This exchange also
+allows cyclic ownership even though physical file reads are contiguous.
 
 ## SpMV Strategy
 
-Rank 0 generates the dense vector `x` once with `fill_dense` and broadcasts it to
-every rank. Each process remaps its owned global rows to compact local CSR rows:
+Rank 0 generates the dense vector `x` once with `fill_dense`. It is broadcast in
+replicated mode or scattered according to cyclic/block ownership in distributed
+modes. Each process remaps its owned global rows to compact local CSR rows. For
+cyclic rows:
 
 ```text
 global row = rank + local row * P
 local row  = global row / P
 ```
 
-The CUDA kernel computes only those local rows. Rank 0 gathers local `y` chunks
-with `MPI_Gatherv` and reconstructs the global vector by placing each gathered
-value back at `rank + local_row * P`. With `--cuda-aware-mpi`, the gather uses
-device send and receive buffers before rank 0 copies the gathered values to the
-host for reconstruction and validation.
+For block rows, the local row is `global row - first owned row`. The CUDA kernel
+computes only those local rows. Rank 0 gathers local `y` chunks with
+`MPI_Gatherv`; cyclic results are interleaved back into global order, while block
+results are already contiguous. With `--cuda-aware-mpi`, the gather uses device
+send and receive buffers before rank 0 copies the gathered values to the host
+for reconstruction and validation.

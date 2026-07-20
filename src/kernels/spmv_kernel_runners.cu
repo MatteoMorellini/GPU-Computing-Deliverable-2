@@ -1051,7 +1051,7 @@ struct CuSparseRunner : BaseRunner {
         CHECK_CUSPARSE(cusparseSpMV_bufferSize(
                            handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
                            &alpha, mat_a, vec_x, &beta, vec_y,
-                           CUDA_R_32F, CUSPARSE_SPMV_CSR_ALG2, &buffer_size),
+                           CUDA_R_32F, CUSPARSE_SPMV_CSR_ALG1, &buffer_size),
                        rank);
         if (buffer_size > 0) {
             CHECK_CUDA(cudaMalloc(&d_buffer, buffer_size), rank);
@@ -1065,7 +1065,7 @@ struct CuSparseRunner : BaseRunner {
         CHECK_CUSPARSE(cusparseSpMV(
                            handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
                            &alpha, mat_a, vec_x, &beta, vec_y,
-                           CUDA_R_32F, CUSPARSE_SPMV_CSR_ALG2, d_buffer),
+                           CUDA_R_32F, CUSPARSE_SPMV_CSR_ALG1, d_buffer),
                        rank);
     }
 
