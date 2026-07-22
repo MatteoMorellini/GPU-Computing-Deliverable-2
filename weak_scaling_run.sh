@@ -24,13 +24,20 @@ X_MODE="${X_MODE:-block}"
 OUTPUT="${OUTPUT:-results/mpi_spmv_weak_scaling.csv}"
 VALIDATION_MAX_ROWS="${VALIDATION_MAX_ROWS:-65536}"
 CUDA_AWARE_MPI="${CUDA_AWARE_MPI:-1}"
+NCCL="${NCCL:-0}"
+
+if [[ "$NCCL" == "1" && -n "${NCCL_MODULE:-}" ]]; then
+    module load "$NCCL_MODULE"
+fi
 
 mkdir -p results
 RUN_ID="${SLURM_JOB_ID:-$$}"
 BASELINE_FILE="${BASELINE_FILE:-results/weak_scaling_baseline_${RUN_ID}.txt}"
 
 CUDA_AWARE_ARGS=()
-if [[ "$CUDA_AWARE_MPI" == "1" ]]; then
+if [[ "$NCCL" == "1" ]]; then
+    CUDA_AWARE_ARGS+=(--nccl)
+elif [[ "$CUDA_AWARE_MPI" == "1" ]]; then
     CUDA_AWARE_ARGS+=(--cuda-aware-mpi)
 fi
 

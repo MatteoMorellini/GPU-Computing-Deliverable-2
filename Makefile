@@ -9,6 +9,17 @@ GRAPH500_DIR ?= graph500
 
 CFLAGS = -Wall -Wextra -O2 -Iinclude
 NVCCFLAGS = -O2 -arch=sm_80 -Iinclude
+NCCL ?= 0
+NCCL_ROOT ?= $(EBROOTNCCL)
+ifeq ($(NCCL),1)
+NVCCFLAGS += -DUSE_NCCL
+ifneq ($(strip $(NCCL_ROOT)),)
+NVCCFLAGS += -I$(NCCL_ROOT)/include
+NCCL_LDFLAGS = -L$(NCCL_ROOT)/lib -L$(NCCL_ROOT)/lib64 -lnccl
+else
+NCCL_LDFLAGS = -lnccl
+endif
+endif
 METIS_ROOT ?= $(EBROOTMETIS)
 ifneq ($(strip $(METIS_ROOT)),)
 CFLAGS += -I$(METIS_ROOT)/include
@@ -61,11 +72,11 @@ $(DISTRIBUTE_TARGET): $(LIB_OBJ) $(DISTRIBUTE_MAIN_OBJ) | bin
 	$(MPICC) $(CFLAGS) $(LIB_OBJ) $(DISTRIBUTE_MAIN_OBJ) -o $@ $(METIS_LDFLAGS) -lm
 
 $(SPMV_TARGET): $(LIB_OBJ) $(SPMV_CUDA_SRC) $(HEADERS) | bin
-	$(NVCC) $(NVCCFLAGS) -ccbin $(MPICXX) $(SPMV_CUDA_SRC) $(LIB_OBJ) -o $@ -lcusparse $(METIS_LDFLAGS)
+	$(NVCC) $(NVCCFLAGS) -ccbin $(MPICXX) $(SPMV_CUDA_SRC) $(LIB_OBJ) -o $@ -lcusparse $(NCCL_LDFLAGS) $(METIS_LDFLAGS)
 
 $(WEAK_SPMV_TARGET): $(LIB_OBJ) $(WEAK_SPMV_CUDA_SRC) \
                      src/mpi/spmv_mpi_cuda.cu $(HEADERS) | bin
-	$(NVCC) $(NVCCFLAGS) -ccbin $(MPICXX) $(WEAK_SPMV_CUDA_SRC) $(LIB_OBJ) -o $@ -lcusparse $(METIS_LDFLAGS)
+	$(NVCC) $(NVCCFLAGS) -ccbin $(MPICXX) $(WEAK_SPMV_CUDA_SRC) $(LIB_OBJ) -o $@ -lcusparse $(NCCL_LDFLAGS) $(METIS_LDFLAGS)
 
 $(MPI_IO_TEST_TARGET): $(LIB_OBJ) $(MPI_IO_TEST_SRC) $(HEADERS) | bin
 	$(MPICC) $(CFLAGS) $(LIB_OBJ) $(MPI_IO_TEST_SRC) -o $@ $(METIS_LDFLAGS) -lm

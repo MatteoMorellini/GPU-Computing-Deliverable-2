@@ -1,6 +1,10 @@
 #include <cuda_runtime.h>
 #include <mpi.h>
 
+#ifdef USE_NCCL
+#include <nccl.h>
+#endif
+
 #include <dirent.h>
 #include <math.h>
 #include <stdio.h>
@@ -23,6 +27,29 @@ typedef MatrixPartitionMode XVectorMode;
 #define X_MODE_DISTRIBUTED_BLOCK MATRIX_PARTITION_1D_BLOCK
 
 static const MatrixPartition *active_partition = NULL;
+
+typedef enum {
+    COMM_HOST_MPI = 0,
+    COMM_CUDA_AWARE_MPI,
+    COMM_NCCL
+} CommunicationBackend;
+
+static CommunicationBackend active_communication_backend = COMM_HOST_MPI;
+
+static int communication_uses_device_buffers(void) {
+    return active_communication_backend != COMM_HOST_MPI;
+}
+
+static const char *communication_backend_name(void) {
+    switch (active_communication_backend) {
+        case COMM_CUDA_AWARE_MPI:
+            return "CUDA-aware MPI";
+        case COMM_NCCL:
+            return "NCCL";
+        default:
+            return "host-staged MPI";
+    }
+}
 
 typedef enum {
     INPUT_MODE_DISTRIBUTED = 0,
@@ -56,6 +83,66 @@ static void check_cuda(cudaError_t status,
 
 #define CHECK_CUDA(call, rank) \
     check_cuda((call), #call, __FILE__, __LINE__, (rank))
+
+#ifdef USE_NCCL
+static ncclComm_t active_nccl_comm;
+static cudaStream_t active_nccl_stream;
+static int active_nccl_initialized = 0;
+
+static void check_nccl(ncclResult_t status,
+                       const char *call,
+                       const char *file,
+                       int line,
+                       int rank) {
+    if (status != ncclSuccess) {
+        fprintf(stderr, "Rank %d NCCL error at %s:%d in %s: %s\n",
+                rank, file, line, call, ncclGetErrorString(status));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+
+#define CHECK_NCCL(call, rank) \
+    check_nccl((call), #call, __FILE__, __LINE__, (rank))
+#endif
+
+static int nccl_backend_is_compiled(void) {
+#ifdef USE_NCCL
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static void initialize_nccl_backend(int rank, int size, MPI_Comm comm) {
+    if (active_communication_backend != COMM_NCCL) return;
+#ifdef USE_NCCL
+    ncclUniqueId id;
+    if (rank == 0) CHECK_NCCL(ncclGetUniqueId(&id), rank);
+    MPI_Bcast(&id, (int)sizeof(id), MPI_BYTE, 0, comm);
+    CHECK_CUDA(cudaStreamCreateWithFlags(&active_nccl_stream,
+                                         cudaStreamNonBlocking), rank);
+    CHECK_NCCL(ncclCommInitRank(&active_nccl_comm, size, id, rank), rank);
+    active_nccl_initialized = 1;
+#else
+    (void)rank;
+    (void)size;
+    (void)comm;
+#endif
+}
+
+static void finalize_nccl_backend(int rank) {
+    if (active_communication_backend != COMM_NCCL) return;
+#ifdef USE_NCCL
+    if (active_nccl_initialized) {
+        CHECK_CUDA(cudaStreamSynchronize(active_nccl_stream), rank);
+        CHECK_NCCL(ncclCommDestroy(active_nccl_comm), rank);
+        CHECK_CUDA(cudaStreamDestroy(active_nccl_stream), rank);
+        active_nccl_initialized = 0;
+    }
+#else
+    (void)rank;
+#endif
+}
 
 static void abort_all(const char *message, int rank) {
     if (rank == 0) {
@@ -270,7 +357,7 @@ static void print_usage(const char *program, FILE *stream) {
             "[--partition-file path] [--partition-seed N] "
             "[--process-grid ROWSxCOLS] "
             "[--input-mode root|distributed|mpi-io] "
-            "[--cuda-aware-mpi]\n"
+            "[--cuda-aware-mpi | --nccl]\n"
             "Runs every .mtx file in %s.\n",
             program, BENCH_MATRICES_DIR);
     print_spmv_kernel_choices(stream);
@@ -285,6 +372,7 @@ static int parse_args(int argc,
                       XVectorMode *x_mode,
                       MatrixInputMode *input_mode,
                       int *cuda_aware_mpi,
+                      int *use_nccl,
                       const char **partition_file,
                       unsigned long long *partition_seed,
                       int *grid_rows,
@@ -297,6 +385,7 @@ static int parse_args(int argc,
     *x_mode = X_MODE_DISTRIBUTED_CYCLIC;
     *input_mode = INPUT_MODE_DISTRIBUTED;
     *cuda_aware_mpi = 0;
+    *use_nccl = 0;
     *partition_file = NULL;
     *partition_seed = 20260722ULL;
     *grid_rows = 0;
@@ -351,7 +440,11 @@ static int parse_args(int argc,
                 return 1;
             }
         } else if (strcmp(argv[i], "--cuda-aware-mpi") == 0) {
+            if (*use_nccl) return 1;
             *cuda_aware_mpi = 1;
+        } else if (strcmp(argv[i], "--nccl") == 0) {
+            if (*cuda_aware_mpi) return 1;
+            *use_nccl = 1;
         } else if (strcmp(argv[i], "--partition-file") == 0) {
             if (i + 1 >= argc) return 1;
             *partition_file = argv[++i];
@@ -613,6 +706,49 @@ static __global__ void sum_fold_values(const float *values,
     if (i < count) atomicAdd(owned_y + local_indices[i], values[i]);
 }
 
+#ifdef USE_NCCL
+static void nccl_alltoallv_device(const float *send_values,
+                                  const int *send_counts,
+                                  const int *send_displs,
+                                  float *recv_values,
+                                  const int *recv_counts,
+                                  const int *recv_displs,
+                                  int rank,
+                                  int size) {
+    if (send_counts[rank] != recv_counts[rank]) {
+        abort_all("NCCL self-exchange counts do not match", rank);
+    }
+    if (send_counts[rank] > 0) {
+        CHECK_CUDA(cudaMemcpyAsync(
+                       recv_values + recv_displs[rank],
+                       send_values + send_displs[rank],
+                       (size_t)send_counts[rank] * sizeof(float),
+                       cudaMemcpyDeviceToDevice, active_nccl_stream),
+                   rank);
+    }
+
+    CHECK_NCCL(ncclGroupStart(), rank);
+    for (int source = 0; source < size; source++) {
+        if (source != rank && recv_counts[source] > 0) {
+            CHECK_NCCL(ncclRecv(recv_values + recv_displs[source],
+                                (size_t)recv_counts[source], ncclFloat,
+                                source, active_nccl_comm,
+                                active_nccl_stream), rank);
+        }
+    }
+    for (int dest = 0; dest < size; dest++) {
+        if (dest != rank && send_counts[dest] > 0) {
+            CHECK_NCCL(ncclSend(send_values + send_displs[dest],
+                                (size_t)send_counts[dest], ncclFloat,
+                                dest, active_nccl_comm,
+                                active_nccl_stream), rank);
+        }
+    }
+    CHECK_NCCL(ncclGroupEnd(), rank);
+    CHECK_CUDA(cudaStreamSynchronize(active_nccl_stream), rank);
+}
+#endif
+
 static double fold_partial_y(FoldPlan *plan,
                              const float *d_partial_y,
                              float *d_owned_y,
@@ -623,12 +759,33 @@ static double fold_partial_y(FoldPlan *plan,
     if (!plan->enabled) return 0.0;
     const double start = MPI_Wtime();
     if (cuda_aware_mpi) {
-        if (plan->owned_count > 0)
-            CHECK_CUDA(cudaMemset(d_owned_y, 0,
-                                  (size_t)plan->owned_count * sizeof(float)), rank);
-        MPI_Alltoallv(d_partial_y, plan->send_counts, plan->send_displs,
-                      MPI_FLOAT, plan->d_recv_values, plan->recv_counts,
-                      plan->recv_displs, MPI_FLOAT, comm);
+        if (plan->owned_count > 0) {
+#ifdef USE_NCCL
+            if (active_communication_backend == COMM_NCCL) {
+                CHECK_CUDA(cudaMemsetAsync(
+                               d_owned_y, 0,
+                               (size_t)plan->owned_count * sizeof(float),
+                               active_nccl_stream), rank);
+            } else
+#endif
+            {
+                CHECK_CUDA(cudaMemset(
+                               d_owned_y, 0,
+                               (size_t)plan->owned_count * sizeof(float)), rank);
+            }
+        }
+        if (active_communication_backend == COMM_NCCL) {
+#ifdef USE_NCCL
+            nccl_alltoallv_device(
+                d_partial_y, plan->send_counts, plan->send_displs,
+                plan->d_recv_values, plan->recv_counts, plan->recv_displs,
+                rank, plan->size);
+#endif
+        } else {
+            MPI_Alltoallv(d_partial_y, plan->send_counts, plan->send_displs,
+                          MPI_FLOAT, plan->d_recv_values, plan->recv_counts,
+                          plan->recv_displs, MPI_FLOAT, comm);
+        }
         if (plan->recv_count > 0) {
             const int threads = 256;
             const int blocks = (plan->recv_count + threads - 1) / threads;
@@ -959,6 +1116,36 @@ static double exchange_ghost_values(DistributedXPlan *plan,
     }
 
     const double start = MPI_Wtime();
+
+    if (active_communication_backend == COMM_NCCL) {
+#ifdef USE_NCCL
+        CHECK_NCCL(ncclGroupStart(), rank);
+        for (int owner = 0; owner < size; owner++) {
+            if (plan->recv_counts[owner] > 0) {
+                CHECK_NCCL(ncclRecv(
+                               d_x + plan->owned_count +
+                                   plan->recv_displs[owner],
+                               (size_t)plan->recv_counts[owner], ncclFloat,
+                               owner, active_nccl_comm, active_nccl_stream),
+                           rank);
+            }
+        }
+        for (int dest = 0; dest < size; dest++) {
+            if (plan->send_counts[dest] > 0) {
+                CHECK_NCCL(ncclSend(
+                               plan->d_send_values +
+                                   plan->send_displs[dest],
+                               (size_t)plan->send_counts[dest], ncclFloat,
+                               dest, active_nccl_comm, active_nccl_stream),
+                           rank);
+            }
+        }
+        CHECK_NCCL(ncclGroupEnd(), rank);
+        CHECK_CUDA(cudaStreamSynchronize(active_nccl_stream), rank);
+#endif
+        return MPI_Wtime() - start;
+    }
+
     int request_count = 0;
 
     for (int owner = 0; owner < size; owner++) {
@@ -1158,6 +1345,42 @@ static void reconstruct_global_y(const float *gathered_y,
     }
 }
 
+#ifdef USE_NCCL
+static void nccl_gatherv_device(const float *send_values,
+                                int send_count,
+                                float *recv_values,
+                                const int *recv_counts,
+                                const int *recv_displs,
+                                int root,
+                                int rank,
+                                int size) {
+    if (rank == root && send_count > 0) {
+        CHECK_CUDA(cudaMemcpyAsync(
+                       recv_values + recv_displs[root], send_values,
+                       (size_t)send_count * sizeof(float),
+                       cudaMemcpyDeviceToDevice, active_nccl_stream),
+                   rank);
+    }
+
+    CHECK_NCCL(ncclGroupStart(), rank);
+    if (rank == root) {
+        for (int source = 0; source < size; source++) {
+            if (source != root && recv_counts[source] > 0) {
+                CHECK_NCCL(ncclRecv(recv_values + recv_displs[source],
+                                    (size_t)recv_counts[source], ncclFloat,
+                                    source, active_nccl_comm,
+                                    active_nccl_stream), rank);
+            }
+        }
+    } else if (send_count > 0) {
+        CHECK_NCCL(ncclSend(send_values, (size_t)send_count, ncclFloat,
+                            root, active_nccl_comm, active_nccl_stream), rank);
+    }
+    CHECK_NCCL(ncclGroupEnd(), rank);
+    CHECK_CUDA(cudaStreamSynchronize(active_nccl_stream), rank);
+}
+#endif
+
 static void execute_kernel(SpmvKernelKind kind,
                            const CSR_Matrix *csr,
                            const CSR_Matrix *d_csr,
@@ -1339,13 +1562,19 @@ static void execute_kernel(SpmvKernelKind kind,
                        cuda_aware_mpi, rank, comm);
 
     double merge_start = MPI_Wtime();
-    MPI_Gatherv(cuda_aware_mpi
-                    ? (fold_plan->enabled ? d_owned_y : d_y)
-                    : y_local,
-                owned_y_count, MPI_FLOAT,
-                cuda_aware_mpi ? d_gathered_y : gathered_y,
-                row_counts, row_displs, MPI_FLOAT,
-                0, comm);
+    const float *device_result = fold_plan->enabled ? d_owned_y : d_y;
+    if (active_communication_backend == COMM_NCCL) {
+#ifdef USE_NCCL
+        nccl_gatherv_device(device_result, owned_y_count, d_gathered_y,
+                            row_counts, row_displs, 0, rank, size);
+#endif
+    } else {
+        MPI_Gatherv(cuda_aware_mpi ? device_result : y_local,
+                    owned_y_count, MPI_FLOAT,
+                    cuda_aware_mpi ? d_gathered_y : gathered_y,
+                    row_counts, row_displs, MPI_FLOAT,
+                    0, comm);
+    }
 
     if (rank == 0) {
         if (cuda_aware_mpi && global_rows > 0) {
@@ -1377,10 +1606,10 @@ static void execute_kernel(SpmvKernelKind kind,
         snprintf(stats.name, sizeof(stats.name), "%s", matrix_name);
         snprintf(stats.format, sizeof(stats.format), "CSR");
         snprintf(stats.implementation, sizeof(stats.implementation),
-                 "MPI %s-in %s-x %s%s",
+                 "MPI %s-in %s-x %s %s",
                  matrix_input_mode_name(input_mode),
                  x_vector_mode_short_name(x_mode), kernel_name,
-                 cuda_aware_mpi ? " CUDA-aware" : "");
+                 communication_backend_name());
         stats.rows = global_rows;
         stats.cols = global_cols;
         stats.nnz = global_nnz;
@@ -1831,9 +2060,8 @@ static int run_matrix(const char *matrix_path,
                    : input_mode == INPUT_MODE_MPI_IO
                          ? " (collective line-aligned MPI-IO chunks)"
                          : " (each rank reads a disjoint file chunk)");
-        printf("MPI buffer mode: %s\n",
-               cuda_aware_mpi ? "CUDA-aware device buffers"
-                              : "host-staged buffers");
+        printf("Iterative communication backend: %s\n",
+               communication_backend_name());
         if (x_mode == X_MODE_DISTRIBUTED_CYCLIC) {
             printf("Distributed x ownership: owner(j)=j%%%d; no full-vector Allgather/Bcast is used for SpMV\n",
                    size);
@@ -1908,6 +2136,7 @@ int main(int argc, char **argv) {
     int reps = 0;
     int warmup = 0;
     int cuda_aware_mpi = 0;
+    int use_nccl = 0;
     const char *partition_file = NULL;
     unsigned long long partition_seed = 0;
     int grid_rows = 0;
@@ -1916,8 +2145,8 @@ int main(int argc, char **argv) {
     XVectorMode x_mode = X_MODE_DISTRIBUTED_CYCLIC;
     MatrixInputMode input_mode = INPUT_MODE_DISTRIBUTED;
     if (parse_args(argc, argv, &kernel_name, &reps, &warmup, &csv_path,
-                   &x_mode, &input_mode, &cuda_aware_mpi, &partition_file,
-                   &partition_seed, &grid_rows, &grid_cols,
+                   &x_mode, &input_mode, &cuda_aware_mpi, &use_nccl,
+                   &partition_file, &partition_seed, &grid_rows, &grid_cols,
                    &single_matrix) != 0) {
         if (rank == 0) {
             print_usage(argv[0], stderr);
@@ -1925,6 +2154,21 @@ int main(int argc, char **argv) {
         MPI_Finalize();
         return 1;
     }
+    if (use_nccl && !nccl_backend_is_compiled()) {
+        if (rank == 0) {
+            fprintf(stderr,
+                    "NCCL support is not compiled in; rebuild with "
+                    "'make NCCL=1'.\n");
+        }
+        MPI_Finalize();
+        return 1;
+    }
+    active_communication_backend = use_nccl
+                                       ? COMM_NCCL
+                                       : cuda_aware_mpi
+                                             ? COMM_CUDA_AWARE_MPI
+                                             : COMM_HOST_MPI;
+    const int device_communication = communication_uses_device_buffers();
 
     SpmvKernelKind kernel_kinds[SPMV_KERNEL_CUSPARSE + 1];
     int kernel_count = 0;
@@ -1964,13 +2208,15 @@ int main(int argc, char **argv) {
         abort_all("No CUDA devices available", rank);
     }
     CHECK_CUDA(cudaSetDevice(rank % device_count), rank);
+    initialize_nccl_backend(rank, size, MPI_COMM_WORLD);
 
     if (single_matrix) {
         const int status = run_matrix(
             single_matrix, kernel_kinds, kernel_count, kernel_name, x_mode,
-            input_mode, reps, warmup, cuda_aware_mpi, csv, csv_path, rank,
+            input_mode, reps, warmup, device_communication, csv, csv_path, rank,
             size, partition_file, partition_seed, grid_rows, grid_cols);
         if (rank == 0) fclose(csv);
+        finalize_nccl_backend(rank);
         MPI_Finalize();
         return status;
     }
@@ -1992,6 +2238,7 @@ int main(int argc, char **argv) {
         if (rank == 0) {
             fclose(csv);
         }
+        finalize_nccl_backend(rank);
         MPI_Finalize();
         return 1;
     }
@@ -2028,7 +2275,7 @@ int main(int argc, char **argv) {
         MPI_Bcast(matrix_path, sizeof(matrix_path), MPI_CHAR, 0,
                   MPI_COMM_WORLD);
         if (run_matrix(matrix_path, kernel_kinds, kernel_count, kernel_name,
-                       x_mode, input_mode, reps, warmup, cuda_aware_mpi, csv,
+                       x_mode, input_mode, reps, warmup, device_communication, csv,
                        csv_path, rank, size, partition_file, partition_seed,
                        grid_rows, grid_cols) != 0) {
             status = 1;
@@ -2046,6 +2293,7 @@ int main(int argc, char **argv) {
     }
 
     MPI_Bcast(&status, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    finalize_nccl_backend(rank);
     MPI_Finalize();
     return status;
 }

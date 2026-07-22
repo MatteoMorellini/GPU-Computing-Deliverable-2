@@ -44,6 +44,16 @@ module load METIS/5.1.0-GCCcore-12.3.0
 make
 ```
 
+NCCL is optional. Load the NCCL module supplied by the cluster and enable it
+at build time (set `NCCL_ROOT` only when the module does not export
+`EBROOTNCCL`):
+
+```bash
+module load NCCL
+make NCCL=1
+# or: make NCCL=1 NCCL_ROOT=/path/to/nccl
+```
+
 The build uses `mpicc` for C helpers and `nvcc -ccbin mpicxx` for the CUDA MPI
 driver. The CUDA build targets `sm_80` because the partial-overlap kernel uses
 CUDA async-copy pipeline APIs, and it links cuSPARSE for the `cusparse` backend.
@@ -159,7 +169,9 @@ PROCESS_GRID=2x2,MATRIX=dummy_matrix/tiny.mtx MPI_run.sh 50 5
 ```
 
 Other script controls are `PARTITION_SEED`, `PARTITION_FILE`, `INPUT_MODE`,
-`KERNEL`, and `CUDA_AWARE_MPI=0|1`.
+`KERNEL`, `CUDA_AWARE_MPI=0|1`, and `NCCL=0|1`. When `NCCL=1`, the script
+passes `--nccl` instead of `--cuda-aware-mpi`. Set `NCCL_MODULE` when the
+batch job must load a site-specific NCCL module itself.
 
 To test whether Open MPI can select the same-node CUDA IPC path, run:
 
@@ -197,6 +209,7 @@ Benchmark controls:
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel all --reps 100 --warmup 5
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --output results/my_run.csv
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --cuda-aware-mpi
+mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --nccl
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --x-mode block
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --x-mode 2d-gp \
   --process-grid 2x2 --matrix dummy_matrix/tiny.mtx
@@ -248,6 +261,14 @@ distributed-x mode, this packs outgoing ghost values on the GPU and receives
 incoming values directly into the compact device vector. The final result
 gather also communicates device buffers directly. An MPI implementation without
 CUDA-aware support may fail when this flag is enabled.
+
+Pass `--nccl` to select the hybrid MPI+NCCL path. MPI still launches and
+coordinates ranks, reads Matrix Market data with MPI-IO, redistributes the
+initial matrix, and exchanges the one-time ghost/fold metadata. NCCL handles
+the repeated GPU-to-GPU ghost exchange, the 2D device result fold, and the
+final variable-size device result gather. `--nccl` and `--cuda-aware-mpi` are
+mutually exclusive. A binary built without `make NCCL=1` rejects `--nccl`
+with a diagnostic instead of silently falling back to MPI.
 
 The default detailed CSV output is:
 
@@ -406,7 +427,8 @@ sbatch --export=ALL,ROWS_PER_GPU=524288,NNZ_PER_ROW=48,REPS=100 \
 
 The defaults are 262144 rows per GPU, 32 nonzeros per row, 5 warm-ups, 50
 measured repetitions, seed 20260721, the adaptive kernel, block-distributed
-vectors, and CUDA-aware MPI. Set `CUDA_AWARE_MPI=0` for host staging. Extra
+vectors, and CUDA-aware MPI. Set `CUDA_AWARE_MPI=0` for host staging or
+`NCCL=1` for NCCL device exchange. Extra
 command-line options passed to the script are appended to the executable
 arguments and therefore override these defaults.
 

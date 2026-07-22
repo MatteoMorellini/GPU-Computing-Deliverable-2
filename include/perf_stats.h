@@ -14,7 +14,7 @@ typedef struct {
 
     char name[256];            // Matrix filename (identifier of dataset)
     char format[32];           // Sparse storage format used (e.g., CSR, COO, ELL)
-    char implementation[32];   // Kernel implementation (e.g., CPU single-core, OpenMP, CUDA)
+    char implementation[96];   // Kernel implementation and communication backend
 
     // -------------------------------------------------------
     // BASIC MATRIX DIMENSIONS

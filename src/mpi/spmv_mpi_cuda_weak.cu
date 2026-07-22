@@ -28,10 +28,11 @@ typedef struct {
     unsigned long long seed;
     XVectorMode x_mode;
     int cuda_aware_mpi;
+    int use_nccl;
 } WeakArgs;
 
 static const char *weak_csv_header(void) {
-    return "implementation,matrix,kernel,x_mode,cuda_aware_mpi,processes,"
+    return "implementation,matrix,kernel,x_mode,cuda_aware_mpi,nccl,processes,"
            "rows_per_rank,nnz_per_row,global_rows,global_cols,global_nnz,"
            "density,seed,warmup,reps,max_rank_time_s,std_max_rank_time_s,"
            "compute_time_s,communication_time_s,gflops,"
@@ -55,7 +56,7 @@ static void weak_usage(const char *program, FILE *stream) {
             "[--nnz-per-row N]\n"
             "          [--reps N] [--warmup N] [--seed N] "
             "[--x-mode block|cyclic|replicated]\n"
-            "          [--cuda-aware-mpi] [--validation-max-rows N] "
+            "          [--cuda-aware-mpi | --nccl] [--validation-max-rows N] "
             "[--output path] [--baseline-file path]\n"
             "\n"
             "Each rank directly generates an exact rows-per-rank by "
@@ -128,11 +129,18 @@ static int parse_weak_args(int argc, char **argv, WeakArgs *args) {
     args->seed = 20260721ULL;
     args->x_mode = X_MODE_DISTRIBUTED_BLOCK;
     args->cuda_aware_mpi = 0;
+    args->use_nccl = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *value = NULL;
         if (strcmp(argv[i], "--cuda-aware-mpi") == 0) {
+            if (args->use_nccl) return 1;
             args->cuda_aware_mpi = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--nccl") == 0) {
+            if (args->cuda_aware_mpi) return 1;
+            args->use_nccl = 1;
             continue;
         }
 
@@ -418,11 +426,11 @@ static int baseline_matches(const WeakArgs *args,
                             int stored_rows,
                             int stored_nnz,
                             unsigned long long stored_seed,
-                            int stored_cuda_aware) {
+                            int stored_backend) {
     return strcmp(kernel, stored_kernel) == 0 &&
            strcmp(mode, stored_mode) == 0 && rows_per_rank == stored_rows &&
            nnz_per_row == stored_nnz && args->seed == stored_seed &&
-           args->cuda_aware_mpi == stored_cuda_aware;
+           (int)active_communication_backend == stored_backend;
 }
 
 static double load_or_store_baseline(const WeakArgs *args,
@@ -439,7 +447,7 @@ static double load_or_store_baseline(const WeakArgs *args,
                 fprintf(file, "%s %s %d %d %llu %d %.17g\n",
                         args->kernel_name, x_vector_mode_short_name(args->x_mode),
                         args->rows_per_rank, args->nnz_per_row, args->seed,
-                        args->cuda_aware_mpi, measured_time);
+                        (int)active_communication_backend, measured_time);
                 fclose(file);
             }
         }
@@ -460,11 +468,11 @@ static double load_or_store_baseline(const WeakArgs *args,
     int stored_rows = 0;
     int stored_nnz = 0;
     unsigned long long stored_seed = 0;
-    int stored_cuda_aware = 0;
+    int stored_backend = 0;
     double baseline = 0.0;
     const int fields = fscanf(file, "%63s %63s %d %d %llu %d %lf",
                               stored_kernel, stored_mode, &stored_rows,
-                              &stored_nnz, &stored_seed, &stored_cuda_aware,
+                              &stored_nnz, &stored_seed, &stored_backend,
                               &baseline);
     fclose(file);
     if (fields != 7 ||
@@ -472,7 +480,7 @@ static double load_or_store_baseline(const WeakArgs *args,
                           args->kernel_name,
                           x_vector_mode_short_name(args->x_mode), stored_kernel,
                           stored_mode, stored_rows, stored_nnz, stored_seed,
-                          stored_cuda_aware)) {
+                          stored_backend)) {
         fprintf(stderr,
                 "Warning: one-GPU baseline configuration does not match; "
                 "efficiency will be NaN\n");
@@ -494,6 +502,21 @@ int main(int argc, char **argv) {
         MPI_Finalize();
         return 1;
     }
+    if (args.use_nccl && !nccl_backend_is_compiled()) {
+        if (rank == 0) {
+            fprintf(stderr,
+                    "NCCL support is not compiled in; rebuild with "
+                    "'make NCCL=1'.\n");
+        }
+        MPI_Finalize();
+        return 1;
+    }
+    active_communication_backend = args.use_nccl
+                                       ? COMM_NCCL
+                                       : args.cuda_aware_mpi
+                                             ? COMM_CUDA_AWARE_MPI
+                                             : COMM_HOST_MPI;
+    const int device_communication = communication_uses_device_buffers();
 
     SpmvKernelKind kernel_kind;
     if (strcmp(args.kernel_name, "all") == 0 ||
@@ -531,6 +554,7 @@ int main(int argc, char **argv) {
     if (device_count <= 0) abort_all("No CUDA devices available", rank);
     CHECK_CUDA(cudaSetDevice(rank % device_count), rank);
     CHECK_CUDA(cudaFree(0), rank);
+    initialize_nccl_backend(rank, size, MPI_COMM_WORLD);
 
     std::vector<double> cpu_reference;
     CSR_Matrix csr = {0};
@@ -592,7 +616,7 @@ int main(int argc, char **argv) {
                           (size_t)x_host_count * sizeof(float),
                           cudaMemcpyHostToDevice),
                rank);
-    if (args.cuda_aware_mpi && x_is_distributed(args.x_mode)) {
+    if (device_communication && x_is_distributed(args.x_mode)) {
         prepare_cuda_aware_x_plan(&x_plan, size, rank);
     }
 
@@ -616,8 +640,8 @@ int main(int argc, char **argv) {
     for (int iteration = 0; iteration < args.warmup; iteration++) {
         if (x_is_distributed(args.x_mode)) {
             exchange_ghost_values(&x_plan, x_host, d_x, size,
-                                  args.cuda_aware_mpi, rank, MPI_COMM_WORLD);
-            if (!args.cuda_aware_mpi && x_plan.ghost_count > 0) {
+                                  device_communication, rank, MPI_COMM_WORLD);
+            if (!device_communication && x_plan.ghost_count > 0) {
                 CHECK_CUDA(cudaMemcpy(d_x + x_plan.owned_count,
                                       x_plan.ghost_values,
                                       (size_t)x_plan.ghost_count *
@@ -652,8 +676,8 @@ int main(int argc, char **argv) {
         if (x_is_distributed(args.x_mode)) {
             const double communication_start = MPI_Wtime();
             exchange_ghost_values(&x_plan, x_host, d_x, size,
-                                  args.cuda_aware_mpi, rank, MPI_COMM_WORLD);
-            if (!args.cuda_aware_mpi && x_plan.ghost_count > 0) {
+                                  device_communication, rank, MPI_COMM_WORLD);
+            if (!device_communication && x_plan.ghost_count > 0) {
                 CHECK_CUDA(cudaMemcpy(d_x + x_plan.owned_count,
                                       x_plan.ghost_values,
                                       (size_t)x_plan.ghost_count *
@@ -697,8 +721,8 @@ int main(int argc, char **argv) {
     if (validation_performed) {
         if (x_is_distributed(args.x_mode)) {
             exchange_ghost_values(&x_plan, x_host, d_x, size,
-                                  args.cuda_aware_mpi, rank, MPI_COMM_WORLD);
-            if (!args.cuda_aware_mpi && x_plan.ghost_count > 0) {
+                                  device_communication, rank, MPI_COMM_WORLD);
+            if (!device_communication && x_plan.ghost_count > 0) {
                 CHECK_CUDA(cudaMemcpy(d_x + x_plan.owned_count,
                                       x_plan.ghost_values,
                                       (size_t)x_plan.ghost_count *
@@ -830,13 +854,13 @@ int main(int argc, char **argv) {
         } else {
             fprintf(
                 csv,
-                "MPI-CUDA-weak,generated-random,%s,%s,%d,%d,%d,%d,%d,%d,"
+                "MPI-CUDA-weak,generated-random,%s,%s,%d,%d,%d,%d,%d,%d,%d,"
                 "%lld,%.9e,%llu,%d,%d,%.9e,%.9e,%.9e,%.9e,%.9f,%.9f,"
                 "%lld,%.3f,%lld,%lld,%.3f,%lld,%lld,%.3f,%lld,%lld,%.3f,"
                 "%lld,%lld,%llu,%.3f,%llu,%llu,%.3f,%llu,%llu,%.3f,%llu,"
                 "%d,%d,%.9e,%.9e,%.9e\n",
                 args.kernel_name, x_vector_mode_short_name(args.x_mode),
-                args.cuda_aware_mpi, size, args.rows_per_rank,
+                args.cuda_aware_mpi, args.use_nccl, size, args.rows_per_rank,
                 args.nnz_per_row, global_rows, global_rows, global_nnz,
                 density, args.seed, args.warmup, args.reps, max_rank_time,
                 time_std, compute_time, communication_time, gflops,
@@ -895,6 +919,7 @@ int main(int argc, char **argv) {
     free_csr(&csr);
     free(x_host);
 
+    finalize_nccl_backend(rank);
     MPI_Finalize();
     return csv_error || (validation_performed && !valid) ? 1 : 0;
 }
