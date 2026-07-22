@@ -13,3 +13,4 @@ ncus/
 *.out
 *.err
 nsys/
+download.sh

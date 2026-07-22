@@ -9,6 +9,23 @@
 
 #define MATRICES_DIR "matrices"
 
+typedef enum {
+    INPUT_MODE_DISTRIBUTED = 0,
+    INPUT_MODE_ROOT,
+    INPUT_MODE_MPI_IO
+} MatrixInputMode;
+
+static const char *matrix_input_mode_name(MatrixInputMode mode) {
+    switch (mode) {
+        case INPUT_MODE_ROOT:
+            return "Root-loaded";
+        case INPUT_MODE_MPI_IO:
+            return "MPI-IO";
+        default:
+            return "Chunked";
+    }
+}
+
 static void print_local_summary(const LocalCOO_Matrix *local,
                                 COORowPartition partition,
                                 int rank,
@@ -138,7 +155,7 @@ static void broadcast_matrix_paths(char ***paths,
 
 static void run_distribution_for_matrix(const char *matrix_path,
                                         COORowPartition partition,
-                                        int root_input,
+                                        MatrixInputMode input_mode,
                                         int rank,
                                         int size) {
     COO_Matrix global = {0};
@@ -150,12 +167,16 @@ static void run_distribution_for_matrix(const char *matrix_path,
     MPI_Barrier(MPI_COMM_WORLD);
     const double input_start = MPI_Wtime();
     double read_seconds = 0.0;
-    if (root_input) {
+    MatrixInputMetrics input_metrics = {0};
+    if (input_mode == INPUT_MODE_ROOT) {
         if (rank == 0) {
+            const double root_read_start = MPI_Wtime();
             read_mtx(matrix_path, &global);
+            input_metrics.read_parse_s = MPI_Wtime() - root_read_start;
         }
-        if (distribute_coo_entries_partitioned(
-                &global, &local, partition, 0, MPI_COMM_WORLD) != 0) {
+        if (distribute_coo_entries_partitioned_timed(
+                &global, &local, partition, 0, &input_metrics,
+                MPI_COMM_WORLD) != 0) {
             if (rank == 0) {
                 fprintf(stderr, "Error distributing root-loaded COO entries for %s\n",
                         matrix_path);
@@ -163,9 +184,21 @@ static void run_distribution_for_matrix(const char *matrix_path,
             }
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
+    } else if (input_mode == INPUT_MODE_MPI_IO) {
+        if (read_mpi_io_coo_entries_timed(
+                matrix_path, &local, partition, &input_metrics,
+                MPI_COMM_WORLD) != 0) {
+            if (rank == 0) {
+                fprintf(stderr,
+                        "Error reading MPI-IO COO entries for %s\n",
+                        matrix_path);
+            }
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
     } else {
-        if (read_distributed_coo_entries(matrix_path, &local, partition,
-                                         MPI_COMM_WORLD) != 0) {
+        if (read_distributed_coo_entries_timed(
+                matrix_path, &local, partition, &input_metrics,
+                MPI_COMM_WORLD) != 0) {
             if (rank == 0) {
                 fprintf(stderr,
                         "Error reading distributed COO entries for %s\n",
@@ -175,8 +208,13 @@ static void run_distribution_for_matrix(const char *matrix_path,
         }
     }
     const double local_read_seconds = MPI_Wtime() - input_start;
+    input_metrics.total_s = local_read_seconds;
     MPI_Reduce(&local_read_seconds, &read_seconds, 1, MPI_DOUBLE, MPI_MAX, 0,
                MPI_COMM_WORLD);
+
+    MatrixInputMetrics global_input_metrics = {0};
+    reduce_matrix_input_metrics(&input_metrics, &global_input_metrics, 0,
+                                MPI_COMM_WORLD);
 
     int total_distributed = 0;
     MPI_Reduce(&local.local_nnz, &total_distributed, 1, MPI_INT, MPI_SUM, 0,
@@ -193,8 +231,27 @@ static void run_distribution_for_matrix(const char *matrix_path,
     MPI_Barrier(MPI_COMM_WORLD);
     if (rank == 0) {
         printf("%s input distributed %d/%d entries across %d ranks in %.6f s\n",
-               root_input ? "Root-loaded" : "Chunked",
+               matrix_input_mode_name(input_mode),
                total_distributed, local.global_nnz, size, read_seconds);
+        const double remote_fraction =
+            global_input_metrics.source_nnz > 0
+                ? (double)global_input_metrics.remote_nnz /
+                      (double)global_input_metrics.source_nnz
+                : 0.0;
+        printf("Input detail: raw read+parse %.6f s "
+               "(MPI file I/O %.6f s, buffer parse %.6f s), "
+               "validation %.6f s, row redistribution %.6f s "
+               "(pack %.6f s, MPI exchange %.6f s), "
+               "remote entries %lld/%lld (%.2f%%)\n",
+               global_input_metrics.read_parse_s,
+               global_input_metrics.file_io_s,
+               global_input_metrics.parse_s,
+               global_input_metrics.validation_s,
+               global_input_metrics.redistribution_s,
+               global_input_metrics.pack_s,
+               global_input_metrics.exchange_s,
+               global_input_metrics.remote_nnz,
+               global_input_metrics.source_nnz, 100.0 * remote_fraction);
     }
 
     free_local_coo(&local);
@@ -212,7 +269,7 @@ int main(int argc, char **argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     COORowPartition partition = COO_ROW_PARTITION_CYCLIC;
-    int root_input = 0;
+    MatrixInputMode input_mode = INPUT_MODE_DISTRIBUTED;
     const char *single_matrix = NULL;
     int arg_error = 0;
     for (int i = 1; i < argc; i++) {
@@ -229,10 +286,14 @@ int main(int argc, char **argv) {
             const char *name = argv[++i];
             if (strcmp(name, "root") == 0 ||
                 strcmp(name, "serial") == 0) {
-                root_input = 1;
+                input_mode = INPUT_MODE_ROOT;
             } else if (strcmp(name, "distributed") == 0 ||
                        strcmp(name, "chunked") == 0) {
-                root_input = 0;
+                input_mode = INPUT_MODE_DISTRIBUTED;
+            } else if (strcmp(name, "mpi-io") == 0 ||
+                       strcmp(name, "mpiio") == 0 ||
+                       strcmp(name, "mpi_io") == 0) {
+                input_mode = INPUT_MODE_MPI_IO;
             } else {
                 arg_error = 1;
             }
@@ -243,7 +304,7 @@ int main(int argc, char **argv) {
     if (arg_error) {
         if (rank == 0) {
             fprintf(stderr,
-                    "Usage: %s [--input-mode root|distributed] "
+                    "Usage: %s [--input-mode root|distributed|mpi-io] "
                     "[--partition cyclic|block] [--matrix path]\n",
                     argv[0]);
         }
@@ -252,7 +313,7 @@ int main(int argc, char **argv) {
     }
 
     if (single_matrix) {
-        run_distribution_for_matrix(single_matrix, partition, root_input,
+        run_distribution_for_matrix(single_matrix, partition, input_mode,
                                     rank, size);
         MPI_Finalize();
         return 0;
@@ -293,7 +354,7 @@ int main(int argc, char **argv) {
     }
 
     for (int i = 0; i < matrix_count; i++) {
-        run_distribution_for_matrix(matrix_paths[i], partition, root_input,
+        run_distribution_for_matrix(matrix_paths[i], partition, input_mode,
                                     rank, size);
         MPI_Barrier(MPI_COMM_WORLD);
     }

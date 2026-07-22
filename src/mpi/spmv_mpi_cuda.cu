@@ -17,15 +17,17 @@
 #include "perf_stats.h"
 #include "spmv_kernel_runner.cuh"
 
-typedef enum {
-    X_MODE_DISTRIBUTED_CYCLIC = 0,
-    X_MODE_REPLICATED,
-    X_MODE_DISTRIBUTED_BLOCK
-} XVectorMode;
+typedef MatrixPartitionMode XVectorMode;
+#define X_MODE_DISTRIBUTED_CYCLIC MATRIX_PARTITION_CYCLIC
+#define X_MODE_REPLICATED MATRIX_PARTITION_REPLICATED
+#define X_MODE_DISTRIBUTED_BLOCK MATRIX_PARTITION_1D_BLOCK
+
+static const MatrixPartition *active_partition = NULL;
 
 typedef enum {
     INPUT_MODE_DISTRIBUTED = 0,
-    INPUT_MODE_ROOT
+    INPUT_MODE_ROOT,
+    INPUT_MODE_MPI_IO
 } MatrixInputMode;
 
 #ifndef BENCH_REPS
@@ -126,54 +128,44 @@ static const char *matrix_basename(const char *path) {
     return slash ? slash + 1 : path;
 }
 
+static int read_matrix_dimensions(const char *path, int *rows, int *cols) {
+    FILE *file = fopen(path, "r");
+    if (!file) return 1;
+    char line[1024];
+    if (!fgets(line, sizeof(line), file)) {
+        fclose(file);
+        return 1;
+    }
+    while (fgets(line, sizeof(line), file)) {
+        if (line[0] == '%') continue;
+        int stored_nnz = 0;
+        const int parsed = sscanf(line, "%d %d %d", rows, cols, &stored_nnz);
+        fclose(file);
+        return parsed == 3 ? 0 : 1;
+    }
+    fclose(file);
+    return 1;
+}
+
 static int has_mtx_extension(const char *name) {
     const char *ext = strrchr(name, '.');
     return ext && strcmp(ext, ".mtx") == 0;
 }
 
 static const char *x_vector_mode_name(XVectorMode mode) {
-    switch (mode) {
-        case X_MODE_REPLICATED:
-            return "replicated";
-        case X_MODE_DISTRIBUTED_BLOCK:
-            return "block-distributed";
-        default:
-            return "cyclic-distributed";
-    }
+    return matrix_partition_mode_name(mode);
 }
 
 static const char *x_vector_mode_short_name(XVectorMode mode) {
-    switch (mode) {
-        case X_MODE_REPLICATED:
-            return "repl";
-        case X_MODE_DISTRIBUTED_BLOCK:
-            return "block";
-        default:
-            return "cyclic";
-    }
+    return matrix_partition_mode_name(mode);
 }
 
 static int parse_x_vector_mode(const char *name, XVectorMode *mode) {
-    if (strcmp(name, "distributed") == 0 || strcmp(name, "dist") == 0 ||
-        strcmp(name, "cyclic") == 0) {
-        *mode = X_MODE_DISTRIBUTED_CYCLIC;
-        return 0;
-    }
-    if (strcmp(name, "replicated") == 0 || strcmp(name, "repl") == 0) {
-        *mode = X_MODE_REPLICATED;
-        return 0;
-    }
-    if (strcmp(name, "block") == 0 ||
-        strcmp(name, "block-distributed") == 0 ||
-        strcmp(name, "chunk") == 0) {
-        *mode = X_MODE_DISTRIBUTED_BLOCK;
-        return 0;
-    }
-    return 1;
+    return parse_matrix_partition_mode(name, mode);
 }
 
 static int x_is_distributed(XVectorMode mode) {
-    return mode != X_MODE_REPLICATED;
+    return matrix_partition_uses_distributed_vector(mode);
 }
 
 static COORowPartition row_partition_for_mode(XVectorMode mode) {
@@ -183,7 +175,14 @@ static COORowPartition row_partition_for_mode(XVectorMode mode) {
 }
 
 static const char *matrix_input_mode_name(MatrixInputMode mode) {
-    return mode == INPUT_MODE_ROOT ? "root" : "distributed";
+    switch (mode) {
+        case INPUT_MODE_ROOT:
+            return "root";
+        case INPUT_MODE_MPI_IO:
+            return "mpi-io";
+        default:
+            return "distributed";
+    }
 }
 
 static int parse_matrix_input_mode(const char *name, MatrixInputMode *mode) {
@@ -194,6 +193,11 @@ static int parse_matrix_input_mode(const char *name, MatrixInputMode *mode) {
     }
     if (strcmp(name, "root") == 0 || strcmp(name, "serial") == 0) {
         *mode = INPUT_MODE_ROOT;
+        return 0;
+    }
+    if (strcmp(name, "mpi-io") == 0 || strcmp(name, "mpiio") == 0 ||
+        strcmp(name, "mpi_io") == 0) {
+        *mode = INPUT_MODE_MPI_IO;
         return 0;
     }
     return 1;
@@ -261,8 +265,11 @@ static void validate_vs_reference(const CSR_Matrix *csr,
 static void print_usage(const char *program, FILE *stream) {
     fprintf(stream,
             "Usage: %s [--kernel <name>] [--reps N] [--warmup N] "
-            "[--output path] [--x-mode replicated|cyclic|block] "
-            "[--input-mode root|distributed] "
+            "[--output path] [--x-mode MODE] "
+            "[--matrix path] "
+            "[--partition-file path] [--partition-seed N] "
+            "[--process-grid ROWSxCOLS] "
+            "[--input-mode root|distributed|mpi-io] "
             "[--cuda-aware-mpi]\n"
             "Runs every .mtx file in %s.\n",
             program, BENCH_MATRICES_DIR);
@@ -277,14 +284,24 @@ static int parse_args(int argc,
                       const char **csv_path,
                       XVectorMode *x_mode,
                       MatrixInputMode *input_mode,
-                      int *cuda_aware_mpi) {
+                      int *cuda_aware_mpi,
+                      const char **partition_file,
+                      unsigned long long *partition_seed,
+                      int *grid_rows,
+                      int *grid_cols,
+                      const char **single_matrix) {
     *kernel_name = "scalar";
     *reps = BENCH_REPS;
     *warmup = BENCH_WARMUP;
-    *csv_path = "results/mpi_spmv.csv";
+    *csv_path = "results/mpi_spmv_detailed.csv";
     *x_mode = X_MODE_DISTRIBUTED_CYCLIC;
     *input_mode = INPUT_MODE_DISTRIBUTED;
     *cuda_aware_mpi = 0;
+    *partition_file = NULL;
+    *partition_seed = 20260722ULL;
+    *grid_rows = 0;
+    *grid_cols = 0;
+    *single_matrix = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--kernel") == 0) {
@@ -335,6 +352,27 @@ static int parse_args(int argc,
             }
         } else if (strcmp(argv[i], "--cuda-aware-mpi") == 0) {
             *cuda_aware_mpi = 1;
+        } else if (strcmp(argv[i], "--partition-file") == 0) {
+            if (i + 1 >= argc) return 1;
+            *partition_file = argv[++i];
+        } else if (strncmp(argv[i], "--partition-file=", 17) == 0) {
+            *partition_file = argv[i] + 17;
+        } else if (strcmp(argv[i], "--partition-seed") == 0) {
+            if (i + 1 >= argc) return 1;
+            *partition_seed = strtoull(argv[++i], NULL, 10);
+        } else if (strncmp(argv[i], "--partition-seed=", 17) == 0) {
+            *partition_seed = strtoull(argv[i] + 17, NULL, 10);
+        } else if (strcmp(argv[i], "--process-grid") == 0 ||
+                   strncmp(argv[i], "--process-grid=", 15) == 0) {
+            const char *value = argv[i][14] == '=' ? argv[i] + 15
+                                                   : (i + 1 < argc ? argv[++i] : NULL);
+            if (!value || sscanf(value, "%dx%d", grid_rows, grid_cols) != 2 ||
+                *grid_rows <= 0 || *grid_cols <= 0) return 1;
+        } else if (strcmp(argv[i], "--matrix") == 0) {
+            if (i + 1 >= argc) return 1;
+            *single_matrix = argv[++i];
+        } else if (strncmp(argv[i], "--matrix=", 9) == 0) {
+            *single_matrix = argv[i] + 9;
         } else {
             return 1;
         }
@@ -354,16 +392,22 @@ static int owned_col_count(int cols,
                            int rank,
                            int size,
                            XVectorMode mode) {
-    return coo_partition_owned_count(
-        cols, rank, size, row_partition_for_mode(mode));
+    if (!active_partition) {
+        return coo_partition_owned_count(
+            cols, rank, size, row_partition_for_mode(mode));
+    }
+    return matrix_partition_owned_count(active_partition, rank);
 }
 
 static int owner_of_vector_entry(int global_col,
                                  int cols,
                                  int size,
                                  XVectorMode mode) {
-    return coo_partition_owner(global_col, cols, size,
-                               row_partition_for_mode(mode));
+    if (!active_partition) {
+        return coo_partition_owner(global_col, cols, size,
+                                   row_partition_for_mode(mode));
+    }
+    return matrix_partition_vertex_owner(active_partition, global_col);
 }
 
 static int owned_vector_local_index(int global_col,
@@ -371,12 +415,15 @@ static int owned_vector_local_index(int global_col,
                                     int rank,
                                     int size,
                                     XVectorMode mode) {
-    if (mode == X_MODE_DISTRIBUTED_BLOCK) {
-        return global_col -
-               coo_partition_first_index(cols, rank, size,
-                                         COO_ROW_PARTITION_BLOCK);
+    if (!active_partition) {
+        if (mode == X_MODE_DISTRIBUTED_BLOCK) {
+            return global_col - coo_partition_first_index(
+                                    cols, rank, size,
+                                    COO_ROW_PARTITION_BLOCK);
+        }
+        return global_col / size;
     }
-    return global_col / size;
+    return matrix_partition_local_index(active_partition, global_col);
 }
 
 static void build_owned_row_counts(int rows,
@@ -384,6 +431,10 @@ static void build_owned_row_counts(int rows,
                                    COORowPartition partition,
                                    int *counts,
                                    int *displs) {
+    if (active_partition) {
+        matrix_partition_build_counts(active_partition, counts, displs);
+        return;
+    }
     int offset = 0;
     for (int rank = 0; rank < size; rank++) {
         counts[rank] = owned_row_count(rows, rank, size, partition);
@@ -431,6 +482,177 @@ typedef struct {
     float *d_send_values;
     MPI_Request *requests;
 } DistributedXPlan;
+
+static void prefix_displacements(const int *counts, int n, int *displs);
+
+typedef struct {
+    int enabled;
+    int local_row_count;
+    int owned_count;
+    int recv_count;
+    int size;
+    int *send_counts;
+    int *send_displs;
+    int *recv_counts;
+    int *recv_displs;
+    int *recv_local_indices;
+    float *send_values;
+    float *recv_values;
+    float *d_recv_values;
+    int *d_recv_local_indices;
+} FoldPlan;
+
+static void free_fold_plan(FoldPlan *plan) {
+    free(plan->send_counts);
+    free(plan->send_displs);
+    free(plan->recv_counts);
+    free(plan->recv_displs);
+    free(plan->recv_local_indices);
+    free(plan->send_values);
+    free(plan->recv_values);
+    cudaFree(plan->d_recv_values);
+    cudaFree(plan->d_recv_local_indices);
+    memset(plan, 0, sizeof(*plan));
+}
+
+static int build_fold_plan(const int *local_global_rows,
+                           int local_row_count,
+                           int rank,
+                           int size,
+                           const MatrixPartition *partition,
+                           int cuda_aware_mpi,
+                           FoldPlan *plan,
+                           MPI_Comm comm) {
+    memset(plan, 0, sizeof(*plan));
+    if (!matrix_partition_is_2d(partition->mode)) return 0;
+    plan->enabled = 1;
+    plan->local_row_count = local_row_count;
+    plan->owned_count = matrix_partition_owned_count(partition, rank);
+    plan->size = size;
+    plan->send_counts = (int *)calloc((size_t)size, sizeof(int));
+    plan->send_displs = (int *)malloc((size_t)size * sizeof(int));
+    plan->recv_counts = (int *)malloc((size_t)size * sizeof(int));
+    plan->recv_displs = (int *)malloc((size_t)size * sizeof(int));
+    int local_error = !plan->send_counts || !plan->send_displs ||
+                      !plan->recv_counts || !plan->recv_displs;
+    if (!local_error) {
+        int previous_owner = -1;
+        for (int i = 0; i < local_row_count; i++) {
+            const int owner = matrix_partition_vertex_owner(
+                partition, local_global_rows[i]);
+            if (owner < previous_owner) local_error = 1;
+            previous_owner = owner;
+            plan->send_counts[owner]++;
+        }
+        prefix_displacements(plan->send_counts, size, plan->send_displs);
+    }
+    int any_error = 0;
+    MPI_Allreduce(&local_error, &any_error, 1, MPI_INT, MPI_MAX, comm);
+    if (any_error) {
+        free_fold_plan(plan);
+        return 1;
+    }
+    MPI_Alltoall(plan->send_counts, 1, MPI_INT,
+                 plan->recv_counts, 1, MPI_INT, comm);
+    prefix_displacements(plan->recv_counts, size, plan->recv_displs);
+    for (int r = 0; r < size; r++) plan->recv_count += plan->recv_counts[r];
+    int *recv_global_rows = plan->recv_count
+                                ? (int *)malloc((size_t)plan->recv_count * sizeof(int))
+                                : NULL;
+    plan->recv_local_indices = plan->recv_count
+                                   ? (int *)malloc((size_t)plan->recv_count * sizeof(int))
+                                   : NULL;
+    if (plan->local_row_count > 0 && !cuda_aware_mpi)
+        plan->send_values = (float *)malloc((size_t)plan->local_row_count * sizeof(float));
+    if (plan->recv_count > 0 && !cuda_aware_mpi)
+        plan->recv_values = (float *)malloc((size_t)plan->recv_count * sizeof(float));
+    local_error = (plan->recv_count && (!recv_global_rows || !plan->recv_local_indices)) ||
+                  (!cuda_aware_mpi && plan->local_row_count && !plan->send_values) ||
+                  (!cuda_aware_mpi && plan->recv_count && !plan->recv_values);
+    MPI_Allreduce(&local_error, &any_error, 1, MPI_INT, MPI_MAX, comm);
+    if (any_error) {
+        free(recv_global_rows);
+        free_fold_plan(plan);
+        return 1;
+    }
+    MPI_Alltoallv(local_global_rows, plan->send_counts, plan->send_displs,
+                  MPI_INT, recv_global_rows, plan->recv_counts,
+                  plan->recv_displs, MPI_INT, comm);
+    for (int i = 0; i < plan->recv_count; i++) {
+        if (matrix_partition_vertex_owner(partition, recv_global_rows[i]) != rank) {
+            local_error = 1;
+            break;
+        }
+        plan->recv_local_indices[i] =
+            matrix_partition_local_index(partition, recv_global_rows[i]);
+    }
+    free(recv_global_rows);
+    MPI_Allreduce(&local_error, &any_error, 1, MPI_INT, MPI_MAX, comm);
+    if (any_error) {
+        free_fold_plan(plan);
+        return 1;
+    }
+    if (cuda_aware_mpi && plan->recv_count > 0) {
+        CHECK_CUDA(cudaMalloc((void **)&plan->d_recv_values,
+                              (size_t)plan->recv_count * sizeof(float)), rank);
+        CHECK_CUDA(cudaMalloc((void **)&plan->d_recv_local_indices,
+                              (size_t)plan->recv_count * sizeof(int)), rank);
+        CHECK_CUDA(cudaMemcpy(plan->d_recv_local_indices,
+                              plan->recv_local_indices,
+                              (size_t)plan->recv_count * sizeof(int),
+                              cudaMemcpyHostToDevice), rank);
+    }
+    return 0;
+}
+
+static __global__ void sum_fold_values(const float *values,
+                                       const int *local_indices,
+                                       int count,
+                                       float *owned_y) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) atomicAdd(owned_y + local_indices[i], values[i]);
+}
+
+static double fold_partial_y(FoldPlan *plan,
+                             const float *d_partial_y,
+                             float *d_owned_y,
+                             float *owned_y,
+                             int cuda_aware_mpi,
+                             int rank,
+                             MPI_Comm comm) {
+    if (!plan->enabled) return 0.0;
+    const double start = MPI_Wtime();
+    if (cuda_aware_mpi) {
+        if (plan->owned_count > 0)
+            CHECK_CUDA(cudaMemset(d_owned_y, 0,
+                                  (size_t)plan->owned_count * sizeof(float)), rank);
+        MPI_Alltoallv(d_partial_y, plan->send_counts, plan->send_displs,
+                      MPI_FLOAT, plan->d_recv_values, plan->recv_counts,
+                      plan->recv_displs, MPI_FLOAT, comm);
+        if (plan->recv_count > 0) {
+            const int threads = 256;
+            const int blocks = (plan->recv_count + threads - 1) / threads;
+            sum_fold_values<<<blocks, threads>>>(
+                plan->d_recv_values, plan->d_recv_local_indices,
+                plan->recv_count, d_owned_y);
+            CHECK_CUDA(cudaGetLastError(), rank);
+            CHECK_CUDA(cudaDeviceSynchronize(), rank);
+        }
+    } else {
+        if (plan->local_row_count > 0)
+            CHECK_CUDA(cudaMemcpy(plan->send_values, d_partial_y,
+                                  (size_t)plan->local_row_count * sizeof(float),
+                                  cudaMemcpyDeviceToHost), rank);
+        MPI_Alltoallv(plan->send_values, plan->send_counts, plan->send_displs,
+                      MPI_FLOAT, plan->recv_values, plan->recv_counts,
+                      plan->recv_displs, MPI_FLOAT, comm);
+        if (plan->owned_count > 0)
+            memset(owned_y, 0, (size_t)plan->owned_count * sizeof(float));
+        for (int i = 0; i < plan->recv_count; i++)
+            owned_y[plan->recv_local_indices[i]] += plan->recv_values[i];
+    }
+    return MPI_Wtime() - start;
+}
 
 static void free_distributed_x_plan(DistributedXPlan *plan) {
     free(plan->recv_counts);
@@ -791,9 +1013,18 @@ static int scatter_owned_x(const float *x_reference,
         } else {
             build_owned_row_counts(cols, size, row_partition_for_mode(mode),
                                    counts, displs);
-            if (mode == X_MODE_DISTRIBUTED_BLOCK) {
+            if (!active_partition && mode == X_MODE_DISTRIBUTED_BLOCK) {
                 memcpy(send_buffer, x_reference,
                        (size_t)cols * sizeof(float));
+            } else if (active_partition) {
+                for (int global_col = 0; global_col < cols; global_col++) {
+                    const int owner = matrix_partition_vertex_owner(
+                        active_partition, global_col);
+                    const int local_col = matrix_partition_local_index(
+                        active_partition, global_col);
+                    send_buffer[displs[owner] + local_col] =
+                        x_reference[global_col];
+                }
             } else {
                 for (int owner = 0; owner < size; owner++) {
                     for (int local_col = 0;
@@ -824,18 +1055,66 @@ static int scatter_owned_x(const float *x_reference,
 
 static int create_local_csr_coo(const LocalCOO_Matrix *local,
                                 int rank,
-                                int size,
-                                COORowPartition partition,
-                                int local_rows,
-                                COO_Matrix *local_as_coo) {
-    local_as_coo->rows = local_rows;
+                                const MatrixPartition *partition,
+                                COO_Matrix *local_as_coo,
+                                int **global_rows_out) {
+    std::vector<int> global_rows;
+    int *row_to_local = NULL;
+    if (matrix_partition_is_2d(partition->mode)) {
+        global_rows.reserve((size_t)local->local_nnz);
+        for (int i = 0; i < local->local_nnz; i++)
+            global_rows.push_back(local->row[i]);
+        std::sort(global_rows.begin(), global_rows.end());
+        global_rows.erase(std::unique(global_rows.begin(), global_rows.end()),
+                          global_rows.end());
+        std::sort(global_rows.begin(), global_rows.end(),
+                  [partition](int a, int b) {
+                      const int owner_a =
+                          matrix_partition_vertex_owner(partition, a);
+                      const int owner_b =
+                          matrix_partition_vertex_owner(partition, b);
+                      return owner_a != owner_b ? owner_a < owner_b : a < b;
+                  });
+    } else {
+        const int owned = matrix_partition_owned_count(partition, rank);
+        global_rows.resize((size_t)owned);
+        for (int row = 0; row < local->rows; row++) {
+            if (matrix_partition_vertex_owner(partition, row) == rank) {
+                global_rows[(size_t)matrix_partition_local_index(partition,
+                                                                 row)] = row;
+            }
+        }
+    }
+
+    local_as_coo->rows = (int)global_rows.size();
     local_as_coo->cols = local->cols;
     local_as_coo->nnz = local->local_nnz;
     local_as_coo->row = NULL;
     local_as_coo->col = local->col;
     local_as_coo->data = local->data;
 
+    if (!global_rows.empty()) {
+        *global_rows_out = (int *)malloc(global_rows.size() * sizeof(int));
+        row_to_local = local->rows
+                           ? (int *)malloc((size_t)local->rows * sizeof(int))
+                           : NULL;
+        if (!*global_rows_out || (local->rows && !row_to_local)) {
+            free(*global_rows_out);
+            *global_rows_out = NULL;
+            free(row_to_local);
+            return 1;
+        }
+        memcpy(*global_rows_out, global_rows.data(),
+               global_rows.size() * sizeof(int));
+        std::fill(row_to_local, row_to_local + local->rows, -1);
+        for (size_t i = 0; i < global_rows.size(); i++)
+            row_to_local[global_rows[i]] = (int)i;
+    } else {
+        *global_rows_out = NULL;
+    }
+
     if (local->local_nnz == 0) {
+        free(row_to_local);
         return 0;
     }
 
@@ -846,9 +1125,9 @@ static int create_local_csr_coo(const LocalCOO_Matrix *local,
 
     for (int i = 0; i < local->local_nnz; i++) {
         int global_row = local->row[i];
-        const int owner =
-            coo_partition_owner(global_row, local->rows, size, partition);
-        if (owner != rank) {
+        const int owner = matrix_partition_entry_owner(
+            partition, global_row, local->col[i]);
+        if (owner != rank || row_to_local[global_row] < 0) {
             fprintf(stderr,
                     "Rank %d received row %d, owned by rank %d\n",
                     rank, global_row, owner);
@@ -856,14 +1135,9 @@ static int create_local_csr_coo(const LocalCOO_Matrix *local,
             local_as_coo->row = NULL;
             return 1;
         }
-        local_as_coo->row[i] =
-            partition == COO_ROW_PARTITION_BLOCK
-                ? global_row -
-                      coo_partition_first_index(local->rows, rank, size,
-                                                partition)
-                : global_row / size;
+        local_as_coo->row[i] = row_to_local[global_row];
     }
-
+    free(row_to_local);
     return 0;
 }
 
@@ -873,27 +1147,14 @@ static void reconstruct_global_y(const float *gathered_y,
                                  const int *row_displs,
                                  int size,
                                  COORowPartition partition) {
-    if (partition == COO_ROW_PARTITION_BLOCK) {
-        int rows = row_displs[size - 1] + row_counts[size - 1];
-        if (rows > 0) {
-            memcpy(y, gathered_y, (size_t)rows * sizeof(float));
-        }
-        return;
-    }
-
-    /*
-     * MPI_Gatherv stores local y chunks grouped by owner rank:
-     *   [rank 0 rows][rank 1 rows][rank 2 rows]...
-     *
-     * Rows are cyclically owned, so rank owner local row k is global row
-     * owner + k * P. Rank 0 uses this mapping only after the timed SpMV work to
-     * rebuild global y for validation/checksum printing.
-     */
-    for (int owner = 0; owner < size; owner++) {
-        for (int local_row = 0; local_row < row_counts[owner]; local_row++) {
-            int global_row = owner + local_row * size;
-            y[global_row] = gathered_y[row_displs[owner] + local_row];
-        }
+    (void)partition;
+    for (int global_row = 0; global_row < active_partition->vertices;
+         global_row++) {
+        const int owner = matrix_partition_vertex_owner(active_partition,
+                                                        global_row);
+        const int local_row = matrix_partition_local_index(active_partition,
+                                                           global_row);
+        y[global_row] = gathered_y[row_displs[owner] + local_row];
     }
 }
 
@@ -904,15 +1165,18 @@ static void execute_kernel(SpmvKernelKind kind,
                            XVectorMode x_mode,
                            MatrixInputMode input_mode,
                            DistributedXPlan *x_plan,
+                           FoldPlan *fold_plan,
                            const float *x_owned,
                            float *d_x,
                            float *d_y,
+                           float *d_owned_y,
                            float *d_gathered_y,
                            float *y_local,
                            float *gathered_y,
                            float *y,
                            const float *x_reference,
                            int local_rows,
+                           int owned_y_count,
                            int global_rows,
                            int global_cols,
                            int global_nnz,
@@ -928,6 +1192,7 @@ static void execute_kernel(SpmvKernelKind kind,
                            double convert_seconds,
                            double h2d_seconds,
                            double file_parse_seconds,
+                           const MatrixInputMetrics *input_metrics,
                            FILE *csv,
                            MPI_Comm comm) {
     const char *kernel_name = spmv_kernel_kind_name(kind);
@@ -968,7 +1233,12 @@ static void execute_kernel(SpmvKernelKind kind,
         }
         if (local_rows > 0) {
             runner->launch(*d_csr, d_x, d_y);
+            if (fold_plan->enabled)
+                CHECK_CUDA(cudaDeviceSynchronize(), rank);
         }
+        if (fold_plan->enabled)
+            fold_partial_y(fold_plan, d_y, d_owned_y, y_local,
+                           cuda_aware_mpi, rank, comm);
     }
     if (local_rows > 0) {
         CHECK_CUDA(cudaGetLastError(), rank);
@@ -1017,6 +1287,11 @@ static void execute_kernel(SpmvKernelKind kind,
                        rank);
             local_compute_seconds = (double)milliseconds / 1000.0;
         }
+        if (fold_plan->enabled) {
+            local_comm_seconds += fold_partial_y(
+                fold_plan, d_y, d_owned_y, y_local, cuda_aware_mpi, rank,
+                comm);
+        }
         const double local_total_seconds = MPI_Wtime() - local_total_start;
 
         double global_total_seconds = 0.0;
@@ -1050,7 +1325,7 @@ static void execute_kernel(SpmvKernelKind kind,
         runner->launch(*d_csr, d_x, d_y);
         CHECK_CUDA(cudaGetLastError(), rank);
         CHECK_CUDA(cudaDeviceSynchronize(), rank);
-        if (!cuda_aware_mpi) {
+        if (!cuda_aware_mpi && !fold_plan->enabled) {
             CHECK_CUDA(cudaMemcpy(y_local, d_y,
                                   (size_t)local_rows * sizeof(float),
                                   cudaMemcpyDeviceToHost),
@@ -1059,9 +1334,15 @@ static void execute_kernel(SpmvKernelKind kind,
         CHECK_CUDA(cudaEventDestroy(event_start), rank);
         CHECK_CUDA(cudaEventDestroy(event_stop), rank);
     }
+    if (fold_plan->enabled)
+        fold_partial_y(fold_plan, d_y, d_owned_y, y_local,
+                       cuda_aware_mpi, rank, comm);
 
     double merge_start = MPI_Wtime();
-    MPI_Gatherv(cuda_aware_mpi ? d_y : y_local, local_rows, MPI_FLOAT,
+    MPI_Gatherv(cuda_aware_mpi
+                    ? (fold_plan->enabled ? d_owned_y : d_y)
+                    : y_local,
+                owned_y_count, MPI_FLOAT,
                 cuda_aware_mpi ? d_gathered_y : gathered_y,
                 row_counts, row_displs, MPI_FLOAT,
                 0, comm);
@@ -1105,6 +1386,20 @@ static void execute_kernel(SpmvKernelKind kind,
         stats.nnz = global_nnz;
         stats.processes = size;
         stats.file_parse_s = file_parse_seconds;
+        stats.input_total_s = input_metrics->total_s;
+        stats.input_read_parse_s = input_metrics->read_parse_s;
+        stats.input_file_io_s = input_metrics->file_io_s;
+        stats.input_parse_s = input_metrics->parse_s;
+        stats.matrix_validation_s = input_metrics->validation_s;
+        stats.matrix_redistribution_s = input_metrics->redistribution_s;
+        stats.matrix_pack_s = input_metrics->pack_s;
+        stats.matrix_exchange_s = input_metrics->exchange_s;
+        stats.matrix_source_nnz = input_metrics->source_nnz;
+        stats.matrix_remote_nnz = input_metrics->remote_nnz;
+        stats.matrix_remote_fraction = input_metrics->source_nnz > 0
+                                           ? (double)input_metrics->remote_nnz /
+                                                 (double)input_metrics->source_nnz
+                                           : 0.0;
         stats.format_conv_s = max_convert_seconds + max_prep_seconds;
         stats.h2d_transfer_s = max_h2d_seconds;
 
@@ -1125,9 +1420,20 @@ static void execute_kernel(SpmvKernelKind kind,
         printf("[%s] avg=%.9f s | comm=%.9f s | compute=%.9f s | GFLOP/s=%.6f | std=%.9f s\n",
                kernel_name, stats.avg_time_s, stats.comm_time_s,
                stats.compute_time_s, stats.gflops, stats.std_time_s);
-        printf("[%s] setup: parse %.6f s, scatter %.6f s, local COO->CSR+prep %.6f s, H2D %.6f s, merge %.6f s\n",
+        printf("[%s] setup: legacy input %.6f s, root scatter %.6f s, local COO->CSR+prep %.6f s, H2D %.6f s, merge %.6f s\n",
                kernel_name, stats.file_parse_s, max_scatter_seconds,
                stats.format_conv_s, stats.h2d_transfer_s, max_merge_seconds);
+        printf("[%s] input detail: total %.6f s | raw read+parse %.6f s "
+               "(MPI file I/O %.6f s, buffer parse %.6f s) | "
+               "validation %.6f s | row redistribution %.6f s "
+               "(pack %.6f s, MPI exchange %.6f s) | "
+               "remote entries %lld/%lld (%.2f%%)\n",
+               kernel_name, stats.input_total_s, stats.input_read_parse_s,
+               stats.input_file_io_s, stats.input_parse_s,
+               stats.matrix_validation_s, stats.matrix_redistribution_s,
+               stats.matrix_pack_s, stats.matrix_exchange_s,
+               stats.matrix_remote_nnz, stats.matrix_source_nnz,
+               100.0 * stats.matrix_remote_fraction);
         printf("[%s] result checksum: %.8e\n", kernel_name,
                checksum(y, global_rows));
 
@@ -1160,27 +1466,79 @@ static int run_matrix(const char *matrix_path,
                       FILE *csv,
                       const char *csv_path,
                       int rank,
-                      int size) {
+                      int size,
+                      const char *partition_file,
+                      unsigned long long partition_seed,
+                      int requested_grid_rows,
+                      int requested_grid_cols) {
     COO_Matrix global = {0};
     CSR_Matrix reference_csr = {0};
     double read_seconds = 0.0;
     double scatter_seconds = 0.0;
     int any_error = 0;
-    const COORowPartition row_partition = row_partition_for_mode(x_mode);
+    MatrixInputMetrics local_input_metrics = {0};
+    MatrixInputMetrics global_input_metrics = {0};
+    MatrixPartition partition = {};
+    partition.mode = x_mode;
+    partition.processes = size;
+    partition.seed = partition_seed;
+    if (matrix_partition_choose_grid(size, requested_grid_rows,
+                                     requested_grid_cols,
+                                     &partition.process_rows,
+                                     &partition.process_cols)) {
+        abort_all("Invalid process grid (ROWS*COLS must equal MPI size)", rank);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double input_total_start = MPI_Wtime();
 
     LocalCOO_Matrix local = {0};
-    if (input_mode == INPUT_MODE_ROOT) {
+    const int needs_explicit_partition =
+        matrix_partition_is_gp_or_hp(x_mode);
+    const int preload_partition_matrix =
+        needs_explicit_partition && !partition_file;
+    if (input_mode == INPUT_MODE_ROOT || preload_partition_matrix) {
         if (rank == 0) {
             const double read_start = MPI_Wtime();
             read_mtx(matrix_path, &global);
             read_seconds = MPI_Wtime() - read_start;
-            coo_to_csr(&global, &reference_csr);
+            local_input_metrics.read_parse_s = read_seconds;
         }
+    }
+    if (input_mode == INPUT_MODE_ROOT || needs_explicit_partition) {
+        int dimensions[2] = {rank == 0 ? global.rows : 0,
+                             rank == 0 ? global.cols : 0};
+        int dimension_error = 0;
+        if (rank == 0 && !global.rows &&
+            read_matrix_dimensions(matrix_path, &dimensions[0],
+                                   &dimensions[1])) {
+            dimension_error = 1;
+        }
+        MPI_Bcast(&dimension_error, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (dimension_error)
+            abort_all("Error reading Matrix Market dimensions", rank);
+        MPI_Bcast(dimensions, 2, MPI_INT, 0, MPI_COMM_WORLD);
+        if (dimensions[0] != dimensions[1] &&
+            matrix_partition_is_2d(x_mode)) {
+            abort_all("Paper 2D layouts require a square matrix", rank);
+        }
+        if (matrix_partition_prepare(
+                &partition, x_mode, dimensions[0], size,
+                requested_grid_rows, requested_grid_cols, partition_seed,
+                partition_file, rank == 0 ? &global : NULL, 0,
+                MPI_COMM_WORLD)) {
+            abort_all("Error constructing matrix partition", rank);
+        }
+        active_partition = &partition;
+    }
+
+    if (input_mode == INPUT_MODE_ROOT) {
 
         MPI_Barrier(MPI_COMM_WORLD);
         const double scatter_start = MPI_Wtime();
-        if (distribute_coo_entries_partitioned(
-                &global, &local, row_partition, 0, MPI_COMM_WORLD) != 0) {
+        if (distribute_coo_entries_layout_timed(
+                &global, &local, &partition, 0, &local_input_metrics,
+                MPI_COMM_WORLD) != 0) {
             if (rank == 0) {
                 free_csr(&reference_csr);
                 free_coo(&global);
@@ -1188,43 +1546,86 @@ static int run_matrix(const char *matrix_path,
             abort_all("Error distributing root-loaded COO entries", rank);
         }
         scatter_seconds = MPI_Wtime() - scatter_start;
+        local_input_metrics.total_s = MPI_Wtime() - input_total_start;
         if (rank == 0) {
+            coo_to_csr(&global, &reference_csr);
             printf("Rank 0 read %s: %d rows, %d cols, %d non-zeros in %.6f s\n",
                    matrix_path, global.rows, global.cols, global.nnz,
                    read_seconds);
         }
     } else {
-        MPI_Barrier(MPI_COMM_WORLD);
         const double read_start = MPI_Wtime();
-        if (read_distributed_coo_entries(matrix_path, &local, row_partition,
-                                         MPI_COMM_WORLD) != 0) {
+        const int read_status =
+            input_mode == INPUT_MODE_MPI_IO
+                ? read_mpi_io_coo_entries_layout_timed(
+                      matrix_path, &local, &partition,
+                      &local_input_metrics, MPI_COMM_WORLD)
+                : read_distributed_coo_entries_layout_timed(
+                      matrix_path, &local, &partition,
+                      &local_input_metrics, MPI_COMM_WORLD);
+        if (read_status != 0) {
             if (rank == 0) {
-                fprintf(stderr, "Error reading distributed COO entries\n");
+                fprintf(stderr, "Error reading %s COO entries\n",
+                        matrix_input_mode_name(input_mode));
             }
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         const double local_read_seconds = MPI_Wtime() - read_start;
+        local_input_metrics.total_s = MPI_Wtime() - input_total_start;
         MPI_Reduce(&local_read_seconds, &read_seconds, 1, MPI_DOUBLE, MPI_MAX,
                    0, MPI_COMM_WORLD);
 
-        if (gather_coo_entries(&local, &global, 0, MPI_COMM_WORLD) != 0) {
+        if (!preload_partition_matrix &&
+            gather_coo_entries(&local, &global, 0, MPI_COMM_WORLD) != 0) {
             free_local_coo(&local);
             abort_all("Error gathering distributed COO for validation", rank);
         }
-        if (rank == 0) {
+        if (!preload_partition_matrix && rank == 0) {
             printf("All ranks read %s: %d rows, %d cols, %d non-zeros in %.6f s\n",
                    matrix_path, global.rows, global.cols, global.nnz,
                    read_seconds);
             coo_to_csr(&global, &reference_csr);
+        } else if (preload_partition_matrix && rank == 0) {
+            coo_to_csr(&global, &reference_csr);
         }
     }
+
+    if (!active_partition) {
+        if (matrix_partition_prepare(
+                &partition, x_mode, local.rows, size,
+                requested_grid_rows, requested_grid_cols, partition_seed,
+                partition_file, NULL, 0, MPI_COMM_WORLD)) {
+            abort_all("Error constructing matrix partition", rank);
+        }
+        active_partition = &partition;
+    }
+
+    reduce_matrix_input_metrics(&local_input_metrics, &global_input_metrics,
+                                0, MPI_COMM_WORLD);
 
     int total_distributed = 0;
     MPI_Reduce(&local.local_nnz, &total_distributed, 1, MPI_INT, MPI_SUM, 0,
                MPI_COMM_WORLD);
 
-    int local_rows =
-        owned_row_count(local.rows, rank, size, row_partition);
+    double convert_start = MPI_Wtime();
+    COO_Matrix local_as_coo = {0};
+    int *local_global_rows = NULL;
+    int remap_error = create_local_csr_coo(
+        &local, rank, &partition, &local_as_coo, &local_global_rows);
+    MPI_Allreduce(&remap_error, &any_error, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    if (any_error) {
+        free(local_as_coo.row);
+        free(local_global_rows);
+        free_local_coo(&local);
+        if (rank == 0) {
+            free_csr(&reference_csr);
+            free_coo(&global);
+        }
+        abort_all("Error remapping matrix rows to local CSR rows", rank);
+    }
+    const int local_rows = local_as_coo.rows;
+    const int owned_y_count = matrix_partition_owned_count(&partition, rank);
     int local_x_count = owned_col_count(local.cols, rank, size, x_mode);
     float *x_reference =
         rank == 0 && local.cols > 0
@@ -1239,8 +1640,8 @@ static int run_matrix(const char *matrix_path,
             ? (float *)malloc((size_t)local.cols * sizeof(float))
             : NULL;
     float *y_local =
-        !cuda_aware_mpi && local_rows > 0
-            ? (float *)malloc((size_t)local_rows * sizeof(float))
+        !cuda_aware_mpi && owned_y_count > 0
+            ? (float *)malloc((size_t)owned_y_count * sizeof(float))
             : NULL;
     float *y = rank == 0 ? (float *)malloc((size_t)local.rows * sizeof(float)) : NULL;
     float *gathered_y = rank == 0 ? (float *)malloc((size_t)local.rows * sizeof(float)) : NULL;
@@ -1249,7 +1650,7 @@ static int run_matrix(const char *matrix_path,
                              local_x_count > 0 && !x_owned) ||
                             (x_mode == X_MODE_REPLICATED &&
                              local.cols > 0 && !x_replicated) ||
-                            (!cuda_aware_mpi && local_rows > 0 && !y_local) ||
+                            (!cuda_aware_mpi && owned_y_count > 0 && !y_local) ||
                             (rank == 0 && (!y || !gathered_y)));
     MPI_Allreduce(&allocation_error, &any_error, 1, MPI_INT, MPI_MAX,
                   MPI_COMM_WORLD);
@@ -1297,28 +1698,6 @@ static int run_matrix(const char *matrix_path,
         MPI_Bcast(x_replicated, local.cols, MPI_FLOAT, 0, MPI_COMM_WORLD);
     }
 
-    double convert_start = MPI_Wtime();
-    COO_Matrix local_as_coo;
-    int remap_error = create_local_csr_coo(
-        &local, rank, size, row_partition, local_rows, &local_as_coo);
-    MPI_Allreduce(&remap_error, &any_error, 1, MPI_INT, MPI_MAX,
-                  MPI_COMM_WORLD);
-    if (any_error) {
-        free(local_as_coo.row);
-        free(x_reference);
-        free(x_owned);
-        free(x_replicated);
-        free(y_local);
-        free(y);
-        free(gathered_y);
-        free_local_coo(&local);
-        if (rank == 0) {
-            free_csr(&reference_csr);
-            free_coo(&global);
-        }
-        abort_all("Error remapping owned rows to local CSR rows", rank);
-    }
-
     CSR_Matrix csr = {0};
     coo_to_csr(&local_as_coo, &csr);
     free(local_as_coo.row);
@@ -1353,11 +1732,25 @@ static int run_matrix(const char *matrix_path,
         }
         abort_all("Error building distributed x ghost plan", rank);
     }
+    FoldPlan fold_plan = {0};
+    int fold_error = build_fold_plan(
+        local_global_rows, local_rows, rank, size, &partition,
+        cuda_aware_mpi, &fold_plan, MPI_COMM_WORLD);
+    MPI_Allreduce(&fold_error, &any_error, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    if (any_error) {
+        free_fold_plan(&fold_plan);
+        free_distributed_x_plan(&x_plan);
+        free_csr(&csr);
+        free(local_global_rows);
+        abort_all("Error building 2D result fold plan", rank);
+    }
     double convert_seconds = MPI_Wtime() - convert_start;
 
     CSR_Matrix d_csr = {0};
     float *d_x = NULL;
     float *d_y = NULL;
+    float *d_owned_y = NULL;
     float *d_gathered_y = NULL;
 
     double h2d_start = MPI_Wtime();
@@ -1387,6 +1780,10 @@ static int run_matrix(const char *matrix_path,
         CHECK_CUDA(cudaMalloc((void **)&d_y, (size_t)local_rows * sizeof(float)),
                    rank);
     }
+    if (cuda_aware_mpi && fold_plan.enabled && owned_y_count > 0) {
+        CHECK_CUDA(cudaMalloc((void **)&d_owned_y,
+                              (size_t)owned_y_count * sizeof(float)), rank);
+    }
     if (cuda_aware_mpi && rank == 0 && local.rows > 0) {
         CHECK_CUDA(cudaMalloc((void **)&d_gathered_y,
                               (size_t)local.rows * sizeof(float)),
@@ -1408,7 +1805,8 @@ static int run_matrix(const char *matrix_path,
             free(row_displs);
             abort_all("Error allocating row gather metadata", rank);
         }
-        build_owned_row_counts(local.rows, size, row_partition,
+        build_owned_row_counts(local.rows, size,
+                               row_partition_for_mode(x_mode),
                                row_counts, row_displs);
     }
 
@@ -1416,11 +1814,23 @@ static int run_matrix(const char *matrix_path,
         printf("Distributed %d/%d entries across %d ranks\n",
                total_distributed, global.nnz, size);
         printf("Dense x mode: %s\n", x_vector_mode_name(x_mode));
+        printf("Matrix partition: %s", matrix_partition_mode_name(x_mode));
+        if (matrix_partition_is_2d(x_mode)) {
+            printf(" on a %dx%d process grid",
+                   partition.process_rows, partition.process_cols);
+        }
+        if (x_mode == MATRIX_PARTITION_1D_RANDOM ||
+            x_mode == MATRIX_PARTITION_2D_RANDOM) {
+            printf(" (seed %llu)", partition.seed);
+        }
+        printf("\n");
         printf("Matrix input mode: %s%s\n",
                matrix_input_mode_name(input_mode),
                input_mode == INPUT_MODE_ROOT
                    ? " (rank 0 reads the complete file)"
-                   : " (each rank reads a disjoint file chunk)");
+                   : input_mode == INPUT_MODE_MPI_IO
+                         ? " (collective line-aligned MPI-IO chunks)"
+                         : " (each rank reads a disjoint file chunk)");
         printf("MPI buffer mode: %s\n",
                cuda_aware_mpi ? "CUDA-aware device buffers"
                               : "host-staged buffers");
@@ -1429,6 +1839,10 @@ static int run_matrix(const char *matrix_path,
                    size);
         } else if (x_mode == X_MODE_DISTRIBUTED_BLOCK) {
             printf("Distributed x ownership: balanced contiguous blocks\n");
+        } else if (x_mode != X_MODE_REPLICATED) {
+            printf("Distributed x ownership: rpart(vertex); %s y fold\n",
+                   matrix_partition_is_2d(x_mode) ? "with 2D partial-"
+                                                  : "without");
         } else {
             printf("Replicated x: every rank stores all %d dense-vector values\n",
                    local.cols);
@@ -1441,20 +1855,24 @@ static int run_matrix(const char *matrix_path,
 
     for (int i = 0; i < kernel_count; i++) {
         execute_kernel(kernel_kinds[i], &csr, &d_csr, &reference_csr, x_mode,
-                       input_mode, &x_plan, x_owned, d_x, d_y, d_gathered_y,
-                       y_local, gathered_y, y, x_reference, local_rows, local.rows,
+                       input_mode, &x_plan, &fold_plan, x_owned, d_x, d_y,
+                       d_owned_y, d_gathered_y, y_local, gathered_y, y,
+                       x_reference, local_rows, owned_y_count, local.rows,
                        local.cols, local.global_nnz, rank, size,
                        row_counts, row_displs, matrix_basename(matrix_path),
                        reps, warmup, cuda_aware_mpi,
                        scatter_seconds, convert_seconds,
-                       h2d_seconds, read_seconds, csv, MPI_COMM_WORLD);
+                       h2d_seconds, read_seconds, &global_input_metrics,
+                       csv, MPI_COMM_WORLD);
     }
 
     cudaFree(d_x);
     cudaFree(d_y);
+    cudaFree(d_owned_y);
     cudaFree(d_gathered_y);
     free_device_csr(&d_csr);
     free_distributed_x_plan(&x_plan);
+    free_fold_plan(&fold_plan);
     free_csr(&csr);
     free(row_counts);
     free(row_displs);
@@ -1464,15 +1882,19 @@ static int run_matrix(const char *matrix_path,
     free(y_local);
     free(y);
     free(gathered_y);
+    free(local_global_rows);
     free_local_coo(&local);
     if (rank == 0) {
         free_csr(&reference_csr);
         free_coo(&global);
     }
+    free_matrix_partition(&partition);
+    active_partition = NULL;
 
     return 0;
 }
 
+#ifndef SPMV_MPI_CUDA_LIBRARY_ONLY
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
 
@@ -1486,10 +1908,17 @@ int main(int argc, char **argv) {
     int reps = 0;
     int warmup = 0;
     int cuda_aware_mpi = 0;
+    const char *partition_file = NULL;
+    unsigned long long partition_seed = 0;
+    int grid_rows = 0;
+    int grid_cols = 0;
+    const char *single_matrix = NULL;
     XVectorMode x_mode = X_MODE_DISTRIBUTED_CYCLIC;
     MatrixInputMode input_mode = INPUT_MODE_DISTRIBUTED;
     if (parse_args(argc, argv, &kernel_name, &reps, &warmup, &csv_path,
-                   &x_mode, &input_mode, &cuda_aware_mpi) != 0) {
+                   &x_mode, &input_mode, &cuda_aware_mpi, &partition_file,
+                   &partition_seed, &grid_rows, &grid_cols,
+                   &single_matrix) != 0) {
         if (rank == 0) {
             print_usage(argv[0], stderr);
         }
@@ -1535,6 +1964,16 @@ int main(int argc, char **argv) {
         abort_all("No CUDA devices available", rank);
     }
     CHECK_CUDA(cudaSetDevice(rank % device_count), rank);
+
+    if (single_matrix) {
+        const int status = run_matrix(
+            single_matrix, kernel_kinds, kernel_count, kernel_name, x_mode,
+            input_mode, reps, warmup, cuda_aware_mpi, csv, csv_path, rank,
+            size, partition_file, partition_seed, grid_rows, grid_cols);
+        if (rank == 0) fclose(csv);
+        MPI_Finalize();
+        return status;
+    }
 
     DIR *dir = NULL;
     int dir_error = 0;
@@ -1590,7 +2029,8 @@ int main(int argc, char **argv) {
                   MPI_COMM_WORLD);
         if (run_matrix(matrix_path, kernel_kinds, kernel_count, kernel_name,
                        x_mode, input_mode, reps, warmup, cuda_aware_mpi, csv,
-                       csv_path, rank, size) != 0) {
+                       csv_path, rank, size, partition_file, partition_seed,
+                       grid_rows, grid_cols) != 0) {
             status = 1;
             break;
         }
@@ -1609,3 +2049,4 @@ int main(int argc, char **argv) {
     MPI_Finalize();
     return status;
 }
+#endif
