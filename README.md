@@ -50,9 +50,13 @@ at build time (set `NCCL_ROOT` only when the module does not export
 
 ```bash
 module load NCCL
+make clean
 make NCCL=1
-# or: make NCCL=1 NCCL_ROOT=/path/to/nccl
+# or: make clean && make NCCL=1 NCCL_ROOT=/path/to/nccl
 ```
+
+Run `make clean` when switching an existing build between `NCCL=0` and
+`NCCL=1`, because both configurations produce binaries with the same names.
 
 The build uses `mpicc` for C helpers and `nvcc -ccbin mpicxx` for the CUDA MPI
 driver. The CUDA build targets `sm_80` because the partial-overlap kernel uses

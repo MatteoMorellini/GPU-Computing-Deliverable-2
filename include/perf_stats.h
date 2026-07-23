@@ -35,7 +35,7 @@ typedef struct {
     double std_time_s;         // Runtime variability across repetitions; indicates stability of memory behavior
                                // and sensitivity to cache / OS scheduling effects
 
-    double comm_time_s;        // Average per-iteration MPI ghost-vector exchange time
+    double comm_time_s;        // Average per-iteration ghost/fold communication time
 
     double compute_time_s;     // Average per-iteration local CUDA SpMV kernel time
 

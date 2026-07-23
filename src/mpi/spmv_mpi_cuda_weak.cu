@@ -549,10 +549,7 @@ int main(int argc, char **argv) {
         args.validation_max_rows > 0 &&
         global_rows <= args.validation_max_rows;
 
-    int device_count = 0;
-    CHECK_CUDA(cudaGetDeviceCount(&device_count), rank);
-    if (device_count <= 0) abort_all("No CUDA devices available", rank);
-    CHECK_CUDA(cudaSetDevice(rank % device_count), rank);
+    select_cuda_device_for_rank(rank, MPI_COMM_WORLD);
     CHECK_CUDA(cudaFree(0), rank);
     initialize_nccl_backend(rank, size, MPI_COMM_WORLD);
 
@@ -882,6 +879,8 @@ int main(int argc, char **argv) {
                "global rows=%d, global NNZ=%lld, density=%.3e\n",
                size, args.rows_per_rank, args.nnz_per_row, global_rows,
                global_nnz, density);
+        printf("Iterative communication backend: %s\n",
+               communication_backend_name());
         printf("Timing (max rank): total=%.9f s, compute=%.9f s, "
                "communication=%.9f s, GFLOP/s=%.6f, efficiency=%.4f\n",
                max_rank_time, compute_time, communication_time, gflops,

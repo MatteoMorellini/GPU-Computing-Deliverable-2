@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=2_gpu
+#SBATCH --job-name=final_NCCL
 #SBATCH --output=mpi_output_%j.out
 #SBATCH --error=mpi_error_%j.err
 #SBATCH --partition=edu-medium
 #SBATCH --account=gpu.computing26
 #SBATCH --nodes=1
-#SBATCH --ntasks=2
+#SBATCH --ntasks=4
 #SBATCH --cpus-per-task=1
-#SBATCH --gres=gpu:a30.24:2
-#SBATCH --mem=96G
+#SBATCH --gres=gpu:a30.24:4
+#SBATCH --mem=96G 
 
 module load CUDA/12.3.2
 module load OpenMpi/4.1.5-CUDA-12.3.2
@@ -17,14 +17,14 @@ module load METIS/5.1.0-GCCcore-12.3.0
 REPS="${1:-50}"
 WARMUP="${2:-5}"
 OUTPUT="${3:-results/mpi_spmv_detailed.csv}"
-MPI_TASKS="${SLURM_NTASKS:-2}"
-PARTITION_MODES="${PARTITION_MODES:- 1d-random 1d-gp 2d-block 2d-gp}"
-# 1d-random 1d-gp 2d-block 2d-random 2d-gp
+MPI_TASKS="${SLURM_NTASKS:-4}"
+PARTITION_MODES="${PARTITION_MODES:- 2d-gp}"
+# 1d-cyclic 1d-random 1d-gp 2d-block 2d-gp
 PARTITION_SEED="${PARTITION_SEED:-20260722}"
 INPUT_MODE="${INPUT_MODE:-mpi-io}"
 KERNEL="${KERNEL:-adaptive}"
 CUDA_AWARE_MPI="${CUDA_AWARE_MPI:-1}"
-NCCL="${NCCL:-0}"
+NCCL="${NCCL:-1}"
 
 if [[ "$NCCL" == "1" && -n "${NCCL_MODULE:-}" ]]; then
     module load "$NCCL_MODULE"

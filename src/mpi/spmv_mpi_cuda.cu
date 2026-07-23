@@ -151,6 +151,35 @@ static void abort_all(const char *message, int rank) {
     MPI_Abort(MPI_COMM_WORLD, 1);
 }
 
+static void select_cuda_device_for_rank(int rank, MPI_Comm comm) {
+    int device_count = 0;
+    CHECK_CUDA(cudaGetDeviceCount(&device_count), rank);
+    if (device_count <= 0) abort_all("No CUDA devices available", rank);
+
+    MPI_Comm local_comm = MPI_COMM_NULL;
+    MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL,
+                        &local_comm);
+    int local_rank = 0;
+    int local_size = 0;
+    MPI_Comm_rank(local_comm, &local_rank);
+    MPI_Comm_size(local_comm, &local_size);
+
+    const int local_oversubscribed =
+        active_communication_backend == COMM_NCCL &&
+        local_size > device_count;
+    int any_oversubscribed = 0;
+    MPI_Allreduce(&local_oversubscribed, &any_oversubscribed, 1, MPI_INT,
+                  MPI_MAX, comm);
+    if (any_oversubscribed) {
+        MPI_Comm_free(&local_comm);
+        abort_all("NCCL requires at most one MPI rank per local CUDA device",
+                  rank);
+    }
+
+    CHECK_CUDA(cudaSetDevice(local_rank % device_count), rank);
+    MPI_Comm_free(&local_comm);
+}
+
 static void reduce_max_time(double local_seconds,
                             double *global_seconds,
                             MPI_Comm comm) {
@@ -2202,12 +2231,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int device_count = 0;
-    CHECK_CUDA(cudaGetDeviceCount(&device_count), rank);
-    if (device_count <= 0) {
-        abort_all("No CUDA devices available", rank);
-    }
-    CHECK_CUDA(cudaSetDevice(rank % device_count), rank);
+    select_cuda_device_for_rank(rank, MPI_COMM_WORLD);
     initialize_nccl_backend(rank, size, MPI_COMM_WORLD);
 
     if (single_matrix) {
