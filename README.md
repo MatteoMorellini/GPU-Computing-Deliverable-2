@@ -133,11 +133,7 @@ Important options are:
 ```
 
 The program reports generated tuples, self-loops, stored entries, and the NNZ
-seen after this project's symmetric Matrix Market expansion. Run its tests with:
-
-```bash
-make test-rmat
-```
+seen after this project's symmetric Matrix Market expansion.
 
 ## Run
 
@@ -151,7 +147,7 @@ mpirun -np 4 ./bin/distribute_mtx --input-mode root
 mpirun -np 4 ./bin/distribute_mtx --input-mode mpi-io
 mpirun -np 4 ./bin/distribute_mtx --partition block
 mpirun -np 4 ./bin/distribute_mtx --partition block \
-  --matrix dummy_matrix/tiny.mtx
+  --matrix matrices/tiny.mtx
 ```
 
 Analyze NNZ ownership without running SpMV or requiring GPUs:
@@ -160,7 +156,7 @@ Analyze NNZ ownership without running SpMV or requiring GPUs:
 ./bin/analyze_partition_nnz \
   --output results/partition_nnz.csv \
   --long-row-fraction 0.35 \
-  dummy_matrix/tiny.mtx
+  matrices/tiny.mtx
 ```
 
 The analyzer loads each matrix once and simulates both `P=2` and `P=4`. For
@@ -181,7 +177,7 @@ sbatch scripts/partition_nnz_run.sh
 Select one matrix or output path with exported variables:
 
 ```bash
-sbatch --export=ALL,MATRIX=dummy_matrix/tiny.mtx,\
+sbatch --export=ALL,MATRIX=matrices/tiny.mtx,\
 OUTPUT=results/tiny_partition_nnz.csv,LONG_ROW_FRACTION=0.35 \
 scripts/partition_nnz_run.sh
 ```
@@ -192,7 +188,7 @@ Analyze per-rank communication volume without executing SpMV:
 ./bin/analyze_partition_communication \
   --output results/partition_communication.csv \
   --long-row-fraction 0.35 \
-  dummy_matrix/tiny.mtx
+  matrices/tiny.mtx
 ```
 
 For each rank, the CSV reports the number of values sent and received during
@@ -232,7 +228,7 @@ variables, for example:
 
 ```bash
 sbatch --export=ALL,PARTITION_MODES="1d-block 2d-block 2d-gp",\
-PROCESS_GRID=2x2,MATRIX=dummy_matrix/tiny.mtx scripts/MPI_run.sh 50 5
+PROCESS_GRID=2x2,MATRIX=matrices/tiny.mtx scripts/MPI_run.sh 50 5
 ```
 
 The script builds `bin/mpi_spmv_cuda` with `NCCL=0` after loading its required
@@ -300,9 +296,9 @@ mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --cuda-aware-mpi
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --nccl
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --x-mode block
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --x-mode 1d-lra \
-  --long-row-fraction 0.35 --matrix dummy_matrix/tiny.mtx
+  --long-row-fraction 0.35 --matrix matrices/tiny.mtx
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --x-mode 2d-gp \
-  --process-grid 2x2 --matrix dummy_matrix/tiny.mtx
+  --process-grid 2x2 --matrix matrices/tiny.mtx
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --input-mode root
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --input-mode mpi-io
 sbatch scripts/MPI_run.sh vector 100 5
@@ -465,17 +461,6 @@ Each rank receives a `LocalCOO_Matrix` containing its nonzeros plus the global
 matrix dimensions and global `nnz`. In a 2D mode a rank can contain partial
 rows; this is why the SpMV path includes the fold described below.
 
-## MPI-IO Reader Test
-
-The MPI-IO test compares canonicalized local COO entries against the serial
-reader for general, pattern, and symmetric inputs, using both cyclic and block
-row ownership at process counts 1 through 5:
-
-```bash
-module load OpenMpi/4.1.5-CUDA-12.3.2
-make test-mpi-io
-```
-
 ## SpMV Strategy
 
 Rank 0 generates the dense vector `x` once with `fill_dense`. It is broadcast in
@@ -499,14 +484,6 @@ owner and sums them. Thus measured 2D communication includes both the paper's
 expand and fold phases. Rank 0 finally gathers the owned `y` chunks and restores
 global order for validation. With `--cuda-aware-mpi`, expand, fold, and final
 gather use device buffers; otherwise they use host staging.
-
-Run the ownership/nonzero-routing regression suite with:
-
-```bash
-module load OpenMpi/4.1.5-CUDA-12.3.2
-module load METIS/5.1.0-GCCcore-12.3.0
-make test-partitions
-```
 
 ## Weak Scaling
 

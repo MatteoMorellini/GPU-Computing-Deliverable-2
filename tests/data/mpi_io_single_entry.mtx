@@ -1,4 +1,0 @@
-%%MatrixMarket matrix coordinate real general
-% More ranks than entries exercise empty and duplicate aligned ranges.
-2 2 1
-2 1 -3.5

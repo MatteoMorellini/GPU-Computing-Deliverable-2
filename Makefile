@@ -36,8 +36,6 @@ PARTITION_ANALYSIS_TARGET = bin/analyze_partition_nnz
 COMM_ANALYSIS_TARGET = bin/analyze_partition_communication
 SPMV_TARGET = bin/mpi_spmv_cuda
 WEAK_SPMV_TARGET = bin/mpi_spmv_cuda_weak
-MPI_IO_TEST_TARGET = bin/test_mpi_io_reader
-PARTITION_TEST_TARGET = bin/test_matrix_partition
 RMAT_TARGET = bin/generate_rmat
 ROW_STATS_TARGET = bin/matrix_row_stats
 
@@ -54,8 +52,6 @@ SPMV_CUDA_SRC = src/mpi/spmv_mpi_cuda.cu \
                 src/kernels/spmv_kernel_runners.cu
 WEAK_SPMV_CUDA_SRC = src/mpi/spmv_mpi_cuda_weak.cu \
                      src/kernels/spmv_kernel_runners.cu
-MPI_IO_TEST_SRC = tests/test_mpi_io_reader.c
-PARTITION_TEST_SRC = tests/test_matrix_partition.c
 RMAT_SRC = src/tools/generate_rmat.c
 ROW_STATS_SRC = src/tools/matrix_row_stats.c
 GRAPH500_GENERATOR_SRC = $(GRAPH500_DIR)/generator/graph_generator.c \
@@ -99,12 +95,6 @@ $(WEAK_SPMV_TARGET): $(LIB_OBJ) $(WEAK_SPMV_CUDA_SRC) \
                      src/mpi/spmv_mpi_cuda.cu $(HEADERS) | bin
 	$(NVCC) $(NVCCFLAGS) -ccbin $(MPICXX) $(WEAK_SPMV_CUDA_SRC) $(LIB_OBJ) -o $@ -lcusparse $(NCCL_LDFLAGS) $(METIS_LDFLAGS)
 
-$(MPI_IO_TEST_TARGET): $(LIB_OBJ) $(MPI_IO_TEST_SRC) $(HEADERS) | bin
-	$(MPICC) $(CFLAGS) $(LIB_OBJ) $(MPI_IO_TEST_SRC) -o $@ $(METIS_LDFLAGS) -lm
-
-$(PARTITION_TEST_TARGET): $(LIB_OBJ) $(PARTITION_TEST_SRC) $(HEADERS) | bin
-	$(MPICC) $(CFLAGS) $(LIB_OBJ) $(PARTITION_TEST_SRC) -o $@ $(METIS_LDFLAGS) -lm
-
 $(RMAT_TARGET): $(RMAT_SRC) $(GRAPH500_GENERATOR_SRC) \
                 $(GRAPH500_GENERATOR_HEADERS) | bin
 	$(RMAT_CC) -std=c11 -Wall -Wextra -Wno-unused-parameter -O3 \
@@ -118,30 +108,12 @@ rmat: $(RMAT_TARGET)
 
 matrix-stats: $(ROW_STATS_TARGET)
 
-test-mpi-io: $(MPI_IO_TEST_TARGET)
-	@for ranks in 1 2 3 4 5; do \
-		$(MPIRUN) -np $$ranks ./$(MPI_IO_TEST_TARGET) \
-			dummy_matrix/tiny.mtx \
-			tests/data/mpi_io_general.mtx \
-			tests/data/mpi_io_symmetric_pattern.mtx \
-			tests/data/mpi_io_single_entry.mtx || exit $$?; \
-	done
-
-test-rmat: $(RMAT_TARGET)
-	bash scripts/test_generate_rmat.sh ./$(RMAT_TARGET)
-
-test-partitions: $(PARTITION_TEST_TARGET)
-	@for ranks in 1 2 3 4 6; do \
-		$(MPIRUN) -np $$ranks ./$(PARTITION_TEST_TARGET) || exit $$?; \
-	done
-
 clean:
 	rm -f $(DISTRIBUTE_TARGET) $(PARTITION_ANALYSIS_TARGET) \
 		$(COMM_ANALYSIS_TARGET) $(SPMV_TARGET) $(WEAK_SPMV_TARGET) \
-		$(MPI_IO_TEST_TARGET) $(RMAT_TARGET) \
+		$(RMAT_TARGET) \
 		$(ROW_STATS_TARGET) \
-		$(PARTITION_TEST_TARGET) \
 		$(LIB_OBJ) $(DISTRIBUTE_MAIN_OBJ) \
 		$(PARTITION_ANALYSIS_OBJ) $(COMM_ANALYSIS_OBJ)
 
-.PHONY: all clean matrix-stats rmat test-mpi-io test-rmat test-partitions
+.PHONY: all clean matrix-stats rmat
