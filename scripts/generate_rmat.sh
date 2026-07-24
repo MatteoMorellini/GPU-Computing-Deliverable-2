@@ -9,20 +9,17 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --gres=gpu:0
 
+set -euo pipefail
+
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$REPO_ROOT"
+
 # rmat_22: approximately 38M expanded NNZ
 ./bin/generate_rmat \
     --scale 22 \
     --edges 18874368 \
     --output matrices/rmat_22.mtx
-"""
-# rmat_24: approximately 151M expanded NNZ
-./bin/generate_rmat \
-    --scale 24 \
-    --edges 75497472 \
-    --output matrices/rmat_24.mtx
 
-# rmat_26: approximately 604M expanded NNZ
-./bin/generate_rmat \
-    --scale 26 \
-    --edges 301989888 \
-    --output matrices/rmat_26.mtx"""
+# To generate a larger matrix, replace the parameters above with one of these:
+# rmat_24: --scale 24 --edges 75497472 --output matrices/rmat_24.mtx
+# rmat_26: --scale 26 --edges 301989888 --output matrices/rmat_26.mtx

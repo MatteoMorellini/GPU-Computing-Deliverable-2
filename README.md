@@ -23,12 +23,17 @@ Computations on Large Scale-Free Graphs Using 2D Graph Partitioning*.
 - `include/mpi_coo_distribution.h`, `src/mpi/mpi_coo_distribution.c` - MPI
   helper that broadcasts matrix metadata and scatters COO entries.
 - `src/mpi/distribute_mtx.c` - distribution-only smoke-test executable.
+- `src/tools/analyze_partition_nnz.c` - distribution-only NNZ ownership
+  analysis for six selected layouts at simulated process counts 2 and 4.
+- `src/tools/analyze_partition_communication.c` - per-rank, per-SpMV
+  communication-volume analysis for the same layouts and process counts.
 - `src/mpi/spmv_mpi_cuda.cu` - MPI multi-GPU SpMV executable.
 - `src/mpi/spmv_mpi_cuda_weak.cu` - separate direct-CSR weak-scaling
   benchmark; it reuses the strong driver's vector ownership and ghost exchange
   implementation without entering its Matrix Market workflow.
 - `src/tools/generate_rmat.c` - chunked Matrix Market wrapper around the
   official Graph500 R-MAT/Kronecker generator.
+- `scripts/` - Slurm launchers, dataset utilities, and shell test helpers.
 - `include/spmv_kernel_runner.cuh`, `src/kernels/spmv_kernel_runners.cu` -
   common runner interface and selectable CUDA/cuSPARSE kernel implementations.
 - `matrices/tiny.mtx` - small input file for smoke testing.
@@ -65,6 +70,8 @@ It produces:
 
 ```bash
 bin/distribute_mtx
+bin/analyze_partition_nnz
+bin/analyze_partition_communication
 bin/mpi_spmv_cuda
 bin/mpi_spmv_cuda_weak
 ```
@@ -147,6 +154,61 @@ mpirun -np 4 ./bin/distribute_mtx --partition block \
   --matrix dummy_matrix/tiny.mtx
 ```
 
+Analyze NNZ ownership without running SpMV or requiring GPUs:
+
+```bash
+./bin/analyze_partition_nnz \
+  --output results/partition_nnz.csv \
+  --long-row-fraction 0.35 \
+  dummy_matrix/tiny.mtx
+```
+
+The analyzer loads each matrix once and simulates both `P=2` and `P=4`. For
+each process count it uses the same vertex and nonzero ownership functions as
+the SpMV driver for `1d-cyclic`, `1d-block`, `1d-gp`, `1d-lra`, `2d-block`,
+and `2d-gp`. It prints the per-rank NNZ counts and their minimum, average,
+maximum, `max/avg`, and normalized spread. The optional CSV contains one row
+per matrix, process count, and layout; its four rank columns are left empty
+where `P=2`, and it records the fraction used for `1d-lra`. Existing output
+files are preserved unless `--force` is supplied.
+
+Submit the analysis for every matrix in `matrices/` as a CPU-only Slurm job:
+
+```bash
+sbatch scripts/partition_nnz_run.sh
+```
+
+Select one matrix or output path with exported variables:
+
+```bash
+sbatch --export=ALL,MATRIX=dummy_matrix/tiny.mtx,\
+OUTPUT=results/tiny_partition_nnz.csv,LONG_ROW_FRACTION=0.35 \
+scripts/partition_nnz_run.sh
+```
+
+Analyze per-rank communication volume without executing SpMV:
+
+```bash
+./bin/analyze_partition_communication \
+  --output results/partition_communication.csv \
+  --long-row-fraction 0.35 \
+  dummy_matrix/tiny.mtx
+```
+
+For each rank, the CSV reports the number of values sent and received during
+the expand phase (distinct remote `x` entries) and the 2D fold phase (remote
+partial `y` rows), followed by combined values and bytes. A rank's total
+volume is `total_send + total_recv`; summing that column across ranks therefore
+counts every network value once at its sender and once at its receiver. The
+analysis excludes self-copies, one-time plan construction and matrix input,
+and the final result gather used for validation.
+
+Submit the communication analysis for every matrix with:
+
+```bash
+sbatch scripts/communication_volume_run.sh
+```
+
 Run the MPI SpMV benchmark across every `.mtx` file in `matrices/`:
 
 ```bash
@@ -161,26 +223,48 @@ tasks and uses the same GPU type as deliverable 1. It runs every `.mtx` file in
 `results/mpi_spmv_detailed.csv`:
 
 ```bash
-sbatch MPI_run.sh
+sbatch scripts/MPI_run.sh
 ```
 
-`MPI_run.sh` runs all eight paper layouts by default. Select a subset or a
-single input with exported variables, for example:
+`scripts/MPI_run.sh` runs the whitespace-separated layouts in `PARTITION_MODES`
+(`2d-gp` by default). Select another subset or a single input with exported
+variables, for example:
 
 ```bash
 sbatch --export=ALL,PARTITION_MODES="1d-block 2d-block 2d-gp",\
-PROCESS_GRID=2x2,MATRIX=dummy_matrix/tiny.mtx MPI_run.sh 50 5
+PROCESS_GRID=2x2,MATRIX=dummy_matrix/tiny.mtx scripts/MPI_run.sh 50 5
 ```
 
-Other script controls are `PARTITION_SEED`, `PARTITION_FILE`, `INPUT_MODE`,
-`KERNEL`, `CUDA_AWARE_MPI=0|1`, and `NCCL=0|1`. When `NCCL=1`, the script
-passes `--nccl` instead of `--cuda-aware-mpi`. Set `NCCL_MODULE` when the
-batch job must load a site-specific NCCL module itself.
+The script builds `bin/mpi_spmv_cuda` with `NCCL=0` after loading its required
+modules, so it can be submitted directly from a delivery whose `bin/`
+directory is empty.
+
+Other script controls are `PARTITION_SEED`, `PARTITION_FILE`,
+`LONG_ROW_FRACTION`, `INPUT_MODE`, `KERNEL`, and `CUDA_AWARE_MPI=0|1`.
+
+For the NCCL communication backend, build with `make NCCL=1` and submit the
+separate NCCL launcher. It configures the NCCL library path for binaries built
+without an embedded runtime path:
+
+```bash
+sbatch scripts/MPI_run_nccl.sh
+```
+
+When the cluster does not export `EBROOTNCCL`, pass its root at submission:
+`NCCL_ROOT=/path/to/nccl sbatch scripts/MPI_run_nccl.sh`. Optionally set
+`NCCL_MODULE` to load a site-specific NCCL module. Rebuild with `make clean &&
+make NCCL=0` before returning to `scripts/MPI_run.sh`.
+
+For an LRA-only batch run:
+
+```bash
+sbatch --export=ALL,PARTITION_MODES=1d-lra,LONG_ROW_FRACTION=0.35 scripts/MPI_run.sh
+```
 
 To test whether Open MPI can select the same-node CUDA IPC path, run:
 
 ```bash
-sbatch MPI_run.sh --cuda-ipc-test
+sbatch scripts/MPI_run.sh --cuda-ipc-test
 ```
 
 The probe forces the `smcuda` transport so that it cannot silently fall back to
@@ -215,11 +299,13 @@ mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --output results/my_run.csv
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --cuda-aware-mpi
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --nccl
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --x-mode block
+mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --x-mode 1d-lra \
+  --long-row-fraction 0.35 --matrix dummy_matrix/tiny.mtx
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --x-mode 2d-gp \
   --process-grid 2x2 --matrix dummy_matrix/tiny.mtx
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --input-mode root
 mpirun -np 4 ./bin/mpi_spmv_cuda --kernel vector --input-mode mpi-io
-sbatch MPI_run.sh vector 100 5
+sbatch scripts/MPI_run.sh vector 100 5
 ```
 
 Matrix input is selected independently from dense-vector ownership:
@@ -243,18 +329,32 @@ Matrix/vector partition modes are:
 - `--x-mode 1d-gp`: METIS partitions the graph while weighting vertices by
   row nonzeros.
 - `--x-mode 1d-hp`: a built-in balanced row-net hypergraph heuristic is used.
+- `--x-mode 1d-lra` (also `lra` or `long-row-aware`): selects a
+  `floor(--long-row-fraction * rows)` prefix or suffix based on the longest
+  row, then independently NNZ-balances that long-row region and the
+  complementary short-row region into consecutive sub-blocks. Every rank owns
+  one sub-block from each region. For tiny nonempty matrices, the long-row
+  block is clamped to at least one row. The default fraction is `0.35`.
 - `--x-mode 2d-block`, `2d-random`, `2d-gp`, or `2d-hp`: the corresponding
   1D vertex partition is converted to a Cartesian nonzero partition using
   Algorithm 2 from the paper.
 
 The default 2D process grid is the closest factorization of `P` to square.
 Override it with `--process-grid ROWSxCOLS`; the product must equal `P`. Use
-`--partition-seed N` to reproduce random layouts. GP/HP modes may instead read
-an externally generated partition with `--partition-file PATH`. The file must
-contain exactly one zero-based part per vertex, optionally written as
-`vertex part`; parts must be in `[0,P)`. This is the route for using a Zoltan,
-PaToH, or another production hypergraph partition in place of the built-in
-fallback. GP/HP and all 2D modes require a square matrix.
+`--partition-seed N` to reproduce random layouts. Explicit GP/HP/LRA modes may
+instead read an externally generated partition with `--partition-file PATH`.
+The file must contain exactly one zero-based part per vertex, optionally
+written as `vertex part`; parts must be in `[0,P)`. This is the route for using
+a Zoltan, PaToH, or another production partition in place of the built-in
+implementation. GP/HP/LRA and all 2D modes require a square matrix.
+
+The LRA definition follows Section 3.3 of [Gao, Ji, and Wang, *Optimization of
+Large-Scale Sparse Matrix-Vector Multiplication on Multi-GPU Systems*,
+ACM TACO 21(4), 2024](https://doi.org/10.1145/3676847). The paper tunes the
+long-row fraction by matrix and platform; `0.35` is one of its reported LRA
+choices for irregular matrices averaging at least eight nonzeros per row.
+Override it in `scripts/MPI_run.sh` with, for example,
+`LONG_ROW_FRACTION=0.25`.
 
 `--matrix PATH` runs only one Matrix Market input. Without it, the benchmark
 continues to scan every `.mtx` file in `matrices/`.
@@ -410,12 +510,12 @@ make test-partitions
 
 ## Weak Scaling
 
-Weak scaling is a separate executable and batch script; `MPI_run.sh` and the
+Weak scaling is a separate executable and batch script; `scripts/MPI_run.sh` and the
 Matrix Market strong-scaling path are unchanged. Submit the complete 1, 2, 3,
 and 4 GPU experiment with:
 
 ```bash
-sbatch weak_scaling_run.sh
+sbatch scripts/weak_scaling_run.sh
 ```
 
 The script keeps `ROWS_PER_GPU`, `NNZ_PER_ROW`, the kernel, vector ownership,
@@ -426,7 +526,7 @@ controlled with exported variables, for example:
 
 ```bash
 sbatch --export=ALL,ROWS_PER_GPU=524288,NNZ_PER_ROW=48,REPS=100 \
-  weak_scaling_run.sh
+  scripts/weak_scaling_run.sh
 ```
 
 The defaults are 262144 rows per GPU, 32 nonzeros per row, 5 warm-ups, 50

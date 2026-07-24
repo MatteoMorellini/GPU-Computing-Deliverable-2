@@ -1,4 +1,5 @@
 #include <mpi.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,33 @@ static int build_test_matrix(COO_Matrix *matrix) {
         matrix->row[at] = row;
         matrix->col[at] = (row + vertices - 1) % vertices;
         matrix->data[at++] = -1.0;
+    }
+    return 0;
+}
+
+static int build_lra_test_matrix(COO_Matrix *matrix) {
+    static const int row_nnz[12] = {
+        1, 1, 1, 1, 1, 20, 1, 1, 1, 3, 3, 3,
+    };
+    int nnz = 0;
+    for (int row = 0; row < 12; row++) nnz += row_nnz[row];
+
+    memset(matrix, 0, sizeof(*matrix));
+    matrix->rows = 12;
+    matrix->cols = 12;
+    matrix->nnz = nnz;
+    matrix->row = (int *)malloc((size_t)nnz * sizeof(int));
+    matrix->col = (int *)malloc((size_t)nnz * sizeof(int));
+    matrix->data = (double *)malloc((size_t)nnz * sizeof(double));
+    if (!matrix->row || !matrix->col || !matrix->data) return 1;
+
+    int at = 0;
+    for (int row = 0; row < 12; row++) {
+        for (int entry = 0; entry < row_nnz[row]; entry++) {
+            matrix->row[at] = row;
+            matrix->col[at] = entry % 12;
+            matrix->data[at++] = 1.0;
+        }
     }
     return 0;
 }
@@ -81,6 +109,51 @@ static int test_mode(MatrixPartitionMode mode, int rank, int size) {
     return any_error;
 }
 
+static int test_lra_definition(int rank, int size) {
+    if (size != 2) return 0;
+
+    COO_Matrix global = {0};
+    int local_error = rank == 0 && build_lra_test_matrix(&global);
+    int any_error = 0;
+    MPI_Allreduce(&local_error, &any_error, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    if (any_error) {
+        if (rank == 0) free_coo(&global);
+        return 1;
+    }
+
+    MatrixPartition partition = {0};
+    if (matrix_partition_prepare_with_long_row_fraction(
+            &partition, MATRIX_PARTITION_1D_LRA, 12, size, 0, 0,
+            0, 0.25, NULL, rank == 0 ? &global : NULL, 0,
+            MPI_COMM_WORLD)) {
+        if (rank == 0) free_coo(&global);
+        return 1;
+    }
+
+    /*
+     * floor(0.25*12)=3. The longest row is row 5, outside the first
+     * three rows, so Section 3.3 selects rows 9..11 as the long-row
+     * region. Its [3,3,3] NNZ distribution splits after row 9.
+     * The complementary region splits immediately before row 5.
+     */
+    if (matrix_partition_vertex_owner(&partition, 4) != 0 ||
+        matrix_partition_vertex_owner(&partition, 5) != 1 ||
+        matrix_partition_vertex_owner(&partition, 8) != 1 ||
+        matrix_partition_vertex_owner(&partition, 9) != 0 ||
+        matrix_partition_vertex_owner(&partition, 10) != 1 ||
+        matrix_partition_vertex_owner(&partition, 11) != 1 ||
+        fabs(partition.long_row_fraction - 0.25) > 1e-12) {
+        local_error = 1;
+    }
+
+    free_matrix_partition(&partition);
+    if (rank == 0) free_coo(&global);
+    MPI_Allreduce(&local_error, &any_error, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    return any_error;
+}
+
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
     int rank = 0;
@@ -90,6 +163,7 @@ int main(int argc, char **argv) {
     const MatrixPartitionMode modes[] = {
         MATRIX_PARTITION_1D_BLOCK, MATRIX_PARTITION_1D_RANDOM,
         MATRIX_PARTITION_1D_GP, MATRIX_PARTITION_1D_HP,
+        MATRIX_PARTITION_1D_LRA,
         MATRIX_PARTITION_2D_BLOCK, MATRIX_PARTITION_2D_RANDOM,
         MATRIX_PARTITION_2D_GP, MATRIX_PARTITION_2D_HP,
     };
@@ -101,6 +175,22 @@ int main(int argc, char **argv) {
                    mode_failed ? "FAIL" : "PASS");
         failed |= mode_failed;
     }
+    const int lra_failed = test_lra_definition(rank, size);
+    if (rank == 0 && size == 2)
+        printf("1d-lra-paper-definition: %s\n",
+               lra_failed ? "FAIL" : "PASS");
+    failed |= lra_failed;
+
+    MatrixPartitionMode parsed = MATRIX_PARTITION_CYCLIC;
+    int parse_failed =
+        parse_matrix_partition_mode("lra", &parsed) ||
+        parsed != MATRIX_PARTITION_1D_LRA ||
+        parse_matrix_partition_mode("long-row-aware", &parsed) ||
+        parsed != MATRIX_PARTITION_1D_LRA;
+    int any_parse_failed = 0;
+    MPI_Allreduce(&parse_failed, &any_parse_failed, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    failed |= any_parse_failed;
     MPI_Finalize();
     return failed;
 }

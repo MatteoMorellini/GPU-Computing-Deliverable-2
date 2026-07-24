@@ -12,11 +12,14 @@ typedef enum {
     MATRIX_PARTITION_1D_RANDOM,
     MATRIX_PARTITION_1D_GP,
     MATRIX_PARTITION_1D_HP,
+    MATRIX_PARTITION_1D_LRA,
     MATRIX_PARTITION_2D_BLOCK,
     MATRIX_PARTITION_2D_RANDOM,
     MATRIX_PARTITION_2D_GP,
     MATRIX_PARTITION_2D_HP
 } MatrixPartitionMode;
+
+#define MATRIX_PARTITION_DEFAULT_LONG_ROW_FRACTION 0.35
 
 typedef struct {
     MatrixPartitionMode mode;
@@ -25,10 +28,11 @@ typedef struct {
     int process_rows;
     int process_cols;
     unsigned long long seed;
+    double long_row_fraction;
 
-    /* Present for GP/HP modes. Every rank receives the same vertex map. */
+    /* Present for GP/HP/LRA modes. Every rank receives the same vertex map. */
     int *parts;
-    /* O(1) global-to-owner-local lookup for random and GP/HP layouts. */
+    /* O(1) global-to-owner-local lookup for random and explicit layouts. */
     int *local_indices;
 } MatrixPartition;
 
@@ -40,6 +44,7 @@ const char *matrix_partition_mode_name(MatrixPartitionMode mode);
 int parse_matrix_partition_mode(const char *name, MatrixPartitionMode *mode);
 int matrix_partition_is_2d(MatrixPartitionMode mode);
 int matrix_partition_is_gp_or_hp(MatrixPartitionMode mode);
+int matrix_partition_uses_explicit_map(MatrixPartitionMode mode);
 int matrix_partition_uses_distributed_vector(MatrixPartitionMode mode);
 
 int matrix_partition_choose_grid(int processes,
@@ -48,7 +53,10 @@ int matrix_partition_choose_grid(int processes,
                                  int *process_rows,
                                  int *process_cols);
 
-/* Build/broadcast GP or HP rpart. Other modes require no stored map. */
+/*
+ * Build/broadcast an explicit rpart where required. This compatibility entry
+ * point uses MATRIX_PARTITION_DEFAULT_LONG_ROW_FRACTION for LRA.
+ */
 int matrix_partition_prepare(MatrixPartition *partition,
                              MatrixPartitionMode mode,
                              int vertices,
@@ -60,6 +68,20 @@ int matrix_partition_prepare(MatrixPartition *partition,
                              const COO_Matrix *root_matrix,
                              int root,
                              MPI_Comm comm);
+
+int matrix_partition_prepare_with_long_row_fraction(
+    MatrixPartition *partition,
+    MatrixPartitionMode mode,
+    int vertices,
+    int processes,
+    int requested_rows,
+    int requested_cols,
+    unsigned long long seed,
+    double long_row_fraction,
+    const char *partition_file,
+    const COO_Matrix *root_matrix,
+    int root,
+    MPI_Comm comm);
 
 int matrix_partition_vertex_owner(const MatrixPartition *partition,
                                   int vertex);

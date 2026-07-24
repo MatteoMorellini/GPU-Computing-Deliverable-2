@@ -6,6 +6,7 @@
 #endif
 
 #include <dirent.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -384,6 +385,7 @@ static void print_usage(const char *program, FILE *stream) {
             "[--output path] [--x-mode MODE] "
             "[--matrix path] "
             "[--partition-file path] [--partition-seed N] "
+            "[--long-row-fraction F] "
             "[--process-grid ROWSxCOLS] "
             "[--input-mode root|distributed|mpi-io] "
             "[--cuda-aware-mpi | --nccl]\n"
@@ -404,6 +406,7 @@ static int parse_args(int argc,
                       int *use_nccl,
                       const char **partition_file,
                       unsigned long long *partition_seed,
+                      double *long_row_fraction,
                       int *grid_rows,
                       int *grid_cols,
                       const char **single_matrix) {
@@ -417,6 +420,7 @@ static int parse_args(int argc,
     *use_nccl = 0;
     *partition_file = NULL;
     *partition_seed = 20260722ULL;
+    *long_row_fraction = MATRIX_PARTITION_DEFAULT_LONG_ROW_FRACTION;
     *grid_rows = 0;
     *grid_cols = 0;
     *single_matrix = NULL;
@@ -484,6 +488,21 @@ static int parse_args(int argc,
             *partition_seed = strtoull(argv[++i], NULL, 10);
         } else if (strncmp(argv[i], "--partition-seed=", 17) == 0) {
             *partition_seed = strtoull(argv[i] + 17, NULL, 10);
+        } else if (strcmp(argv[i], "--long-row-fraction") == 0 ||
+                   strncmp(argv[i], "--long-row-fraction=", 20) == 0) {
+            const char *value =
+                argv[i][19] == '='
+                    ? argv[i] + 20
+                    : (i + 1 < argc ? argv[++i] : NULL);
+            if (!value) return 1;
+            char *end = NULL;
+            errno = 0;
+            const double parsed = strtod(value, &end);
+            if (errno || !end || end == value || *end != '\0' ||
+                !isfinite(parsed) || parsed <= 0.0 || parsed >= 1.0) {
+                return 1;
+            }
+            *long_row_fraction = parsed;
         } else if (strcmp(argv[i], "--process-grid") == 0 ||
                    strncmp(argv[i], "--process-grid=", 15) == 0) {
             const char *value = argv[i][14] == '=' ? argv[i] + 15
@@ -1727,6 +1746,7 @@ static int run_matrix(const char *matrix_path,
                       int size,
                       const char *partition_file,
                       unsigned long long partition_seed,
+                      double long_row_fraction,
                       int requested_grid_rows,
                       int requested_grid_cols) {
     COO_Matrix global = {0};
@@ -1740,6 +1760,7 @@ static int run_matrix(const char *matrix_path,
     partition.mode = x_mode;
     partition.processes = size;
     partition.seed = partition_seed;
+    partition.long_row_fraction = long_row_fraction;
     if (matrix_partition_choose_grid(size, requested_grid_rows,
                                      requested_grid_cols,
                                      &partition.process_rows,
@@ -1752,7 +1773,7 @@ static int run_matrix(const char *matrix_path,
 
     LocalCOO_Matrix local = {0};
     const int needs_explicit_partition =
-        matrix_partition_is_gp_or_hp(x_mode);
+        matrix_partition_uses_explicit_map(x_mode);
     const int preload_partition_matrix =
         needs_explicit_partition && !partition_file;
     if (input_mode == INPUT_MODE_ROOT || preload_partition_matrix) {
@@ -1780,10 +1801,11 @@ static int run_matrix(const char *matrix_path,
             matrix_partition_is_2d(x_mode)) {
             abort_all("Paper 2D layouts require a square matrix", rank);
         }
-        if (matrix_partition_prepare(
+        if (matrix_partition_prepare_with_long_row_fraction(
                 &partition, x_mode, dimensions[0], size,
                 requested_grid_rows, requested_grid_cols, partition_seed,
-                partition_file, rank == 0 ? &global : NULL, 0,
+                long_row_fraction, partition_file,
+                rank == 0 ? &global : NULL, 0,
                 MPI_COMM_WORLD)) {
             abort_all("Error constructing matrix partition", rank);
         }
@@ -1849,10 +1871,11 @@ static int run_matrix(const char *matrix_path,
     }
 
     if (!active_partition) {
-        if (matrix_partition_prepare(
+        if (matrix_partition_prepare_with_long_row_fraction(
                 &partition, x_mode, local.rows, size,
                 requested_grid_rows, requested_grid_cols, partition_seed,
-                partition_file, NULL, 0, MPI_COMM_WORLD)) {
+                long_row_fraction, partition_file, NULL, 0,
+                MPI_COMM_WORLD)) {
             abort_all("Error constructing matrix partition", rank);
         }
         active_partition = &partition;
@@ -2080,6 +2103,9 @@ static int run_matrix(const char *matrix_path,
         if (x_mode == MATRIX_PARTITION_1D_RANDOM ||
             x_mode == MATRIX_PARTITION_2D_RANDOM) {
             printf(" (seed %llu)", partition.seed);
+        } else if (x_mode == MATRIX_PARTITION_1D_LRA) {
+            printf(" (long-row fraction %.6g)",
+                   partition.long_row_fraction);
         }
         printf("\n");
         printf("Matrix input mode: %s%s\n",
@@ -2168,6 +2194,7 @@ int main(int argc, char **argv) {
     int use_nccl = 0;
     const char *partition_file = NULL;
     unsigned long long partition_seed = 0;
+    double long_row_fraction = 0.0;
     int grid_rows = 0;
     int grid_cols = 0;
     const char *single_matrix = NULL;
@@ -2175,8 +2202,8 @@ int main(int argc, char **argv) {
     MatrixInputMode input_mode = INPUT_MODE_DISTRIBUTED;
     if (parse_args(argc, argv, &kernel_name, &reps, &warmup, &csv_path,
                    &x_mode, &input_mode, &cuda_aware_mpi, &use_nccl,
-                   &partition_file, &partition_seed, &grid_rows, &grid_cols,
-                   &single_matrix) != 0) {
+                   &partition_file, &partition_seed, &long_row_fraction,
+                   &grid_rows, &grid_cols, &single_matrix) != 0) {
         if (rank == 0) {
             print_usage(argv[0], stderr);
         }
@@ -2238,7 +2265,8 @@ int main(int argc, char **argv) {
         const int status = run_matrix(
             single_matrix, kernel_kinds, kernel_count, kernel_name, x_mode,
             input_mode, reps, warmup, device_communication, csv, csv_path, rank,
-            size, partition_file, partition_seed, grid_rows, grid_cols);
+            size, partition_file, partition_seed, long_row_fraction,
+            grid_rows, grid_cols);
         if (rank == 0) fclose(csv);
         finalize_nccl_backend(rank);
         MPI_Finalize();
@@ -2301,7 +2329,7 @@ int main(int argc, char **argv) {
         if (run_matrix(matrix_path, kernel_kinds, kernel_count, kernel_name,
                        x_mode, input_mode, reps, warmup, device_communication, csv,
                        csv_path, rank, size, partition_file, partition_seed,
-                       grid_rows, grid_cols) != 0) {
+                       long_row_fraction, grid_rows, grid_cols) != 0) {
             status = 1;
             break;
         }

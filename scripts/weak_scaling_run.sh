@@ -11,6 +11,9 @@
 
 set -euo pipefail
 
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$REPO_ROOT"
+
 module load CUDA/12.3.2
 module load OpenMpi/4.1.5-CUDA-12.3.2
 

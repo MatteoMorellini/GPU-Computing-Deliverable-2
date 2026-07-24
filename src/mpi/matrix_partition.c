@@ -48,6 +48,7 @@ const char *matrix_partition_mode_name(MatrixPartitionMode mode) {
         case MATRIX_PARTITION_1D_RANDOM: return "1d-random";
         case MATRIX_PARTITION_1D_GP: return "1d-gp";
         case MATRIX_PARTITION_1D_HP: return "1d-hp";
+        case MATRIX_PARTITION_1D_LRA: return "1d-lra";
         case MATRIX_PARTITION_2D_BLOCK: return "2d-block";
         case MATRIX_PARTITION_2D_RANDOM: return "2d-random";
         case MATRIX_PARTITION_2D_GP: return "2d-gp";
@@ -70,6 +71,9 @@ int parse_matrix_partition_mode(const char *name, MatrixPartitionMode *mode) {
         *mode = MATRIX_PARTITION_1D_GP;
     } else if (!strcmp(name, "hp") || !strcmp(name, "1d-hp")) {
         *mode = MATRIX_PARTITION_1D_HP;
+    } else if (!strcmp(name, "lra") || !strcmp(name, "1d-lra") ||
+               !strcmp(name, "long-row-aware")) {
+        *mode = MATRIX_PARTITION_1D_LRA;
     } else if (!strcmp(name, "2d-block")) {
         *mode = MATRIX_PARTITION_2D_BLOCK;
     } else if (!strcmp(name, "2d-random")) {
@@ -91,6 +95,11 @@ int matrix_partition_is_2d(MatrixPartitionMode mode) {
 int matrix_partition_is_gp_or_hp(MatrixPartitionMode mode) {
     return mode == MATRIX_PARTITION_1D_GP || mode == MATRIX_PARTITION_1D_HP ||
            mode == MATRIX_PARTITION_2D_GP || mode == MATRIX_PARTITION_2D_HP;
+}
+
+int matrix_partition_uses_explicit_map(MatrixPartitionMode mode) {
+    return matrix_partition_is_gp_or_hp(mode) ||
+           mode == MATRIX_PARTITION_1D_LRA;
 }
 
 int matrix_partition_uses_distributed_vector(MatrixPartitionMode mode) {
@@ -337,17 +346,129 @@ static int build_hypergraph_partition(const COO_Matrix *matrix,
     return 0;
 }
 
-int matrix_partition_prepare(MatrixPartition *partition,
-                             MatrixPartitionMode mode,
-                             int vertices,
-                             int processes,
-                             int requested_rows,
-                             int requested_cols,
-                             unsigned long long seed,
-                             const char *partition_file,
-                             const COO_Matrix *root_matrix,
-                             int root,
-                             MPI_Comm comm) {
+/*
+ * Split one consecutive row range into consecutive, approximately NNZ-equal
+ * sub-blocks. Boundaries are placed at the row prefix closest to each ideal
+ * cumulative-NNZ target. Empty sub-blocks are allowed when there are fewer
+ * rows than parts or one indivisible row dominates the range.
+ */
+static void assign_nnz_balanced_range(const int *row_nnz,
+                                      int begin,
+                                      int end,
+                                      int parts,
+                                      int *assignment) {
+    long long total = 0;
+    for (int row = begin; row < end; row++) total += row_nnz[row];
+
+    if (total == 0) {
+        const int rows = end - begin;
+        for (int row = begin; row < end; row++) {
+            assignment[row] =
+                balanced_block_owner(row - begin, rows, parts);
+        }
+        return;
+    }
+
+    int previous = begin;
+    int cursor = begin;
+    long long cumulative = 0;
+    for (int part = 0; part < parts - 1; part++) {
+        const long long target =
+            (long long)(((long double)total * (part + 1)) / parts);
+        while (cursor < end &&
+               cumulative + (long long)row_nnz[cursor] < target) {
+            cumulative += row_nnz[cursor++];
+        }
+        if (cursor < end && cumulative <= target) {
+            const long long before_distance = target - cumulative;
+            const long long after =
+                cumulative + (long long)row_nnz[cursor];
+            const long long after_distance = after - target;
+            if (after_distance <= before_distance) {
+                cumulative = after;
+                cursor++;
+            }
+        }
+        for (int row = previous; row < cursor; row++)
+            assignment[row] = part;
+        previous = cursor;
+    }
+    for (int row = previous; row < end; row++)
+        assignment[row] = parts - 1;
+}
+
+/*
+ * Gao, Ji, and Wang, "Optimization of Large-Scale Sparse Matrix-Vector
+ * Multiplication on Multi-GPU Systems", ACM TACO 21(4), 2024, Section 3.3.
+ * https://doi.org/10.1145/3676847
+ *
+ * The longest row selects whether the floor(alpha*n)-row long-row block is
+ * taken from the beginning or the end of the matrix. For tiny nonempty
+ * matrices the block is clamped to at least one row. The long- and short-row
+ * regions are then independently partitioned by cumulative NNZ so every rank
+ * receives one consecutive sub-block from each region.
+ */
+static int build_long_row_aware_partition(const COO_Matrix *matrix,
+                                          int parts,
+                                          double long_row_fraction,
+                                          int *assignment) {
+    const int rows = matrix->rows;
+    if (!(long_row_fraction > 0.0 && long_row_fraction < 1.0)) {
+        fprintf(stderr,
+                "Long-row fraction must be strictly between 0 and 1\n");
+        return 1;
+    }
+    if (rows == 0) return 0;
+
+    int *row_nnz = (int *)calloc((size_t)rows, sizeof(int));
+    if (!row_nnz) return 1;
+    for (int entry = 0; entry < matrix->nnz; entry++) {
+        const int row = matrix->row[entry];
+        if (row < 0 || row >= rows || row_nnz[row] == INT_MAX) {
+            free(row_nnz);
+            return 1;
+        }
+        row_nnz[row]++;
+    }
+
+    int longest_row = 0;
+    for (int row = 1; row < rows; row++) {
+        if (row_nnz[row] > row_nnz[longest_row]) longest_row = row;
+    }
+
+    int long_rows = (int)floor(long_row_fraction * (double)rows);
+    if (long_rows < 1) long_rows = 1;
+    if (rows > 1 && long_rows >= rows) long_rows = rows - 1;
+
+    if (longest_row < long_rows) {
+        assign_nnz_balanced_range(row_nnz, 0, long_rows, parts,
+                                  assignment);
+        assign_nnz_balanced_range(row_nnz, long_rows, rows, parts,
+                                  assignment);
+    } else {
+        const int long_begin = rows - long_rows;
+        assign_nnz_balanced_range(row_nnz, 0, long_begin, parts,
+                                  assignment);
+        assign_nnz_balanced_range(row_nnz, long_begin, rows, parts,
+                                  assignment);
+    }
+    free(row_nnz);
+    return 0;
+}
+
+int matrix_partition_prepare_with_long_row_fraction(
+    MatrixPartition *partition,
+    MatrixPartitionMode mode,
+    int vertices,
+    int processes,
+    int requested_rows,
+    int requested_cols,
+    unsigned long long seed,
+    double long_row_fraction,
+    const char *partition_file,
+    const COO_Matrix *root_matrix,
+    int root,
+    MPI_Comm comm) {
     int rank = 0;
     MPI_Comm_rank(comm, &rank);
     memset(partition, 0, sizeof(*partition));
@@ -356,10 +477,11 @@ int matrix_partition_prepare(MatrixPartition *partition,
     partition->vertices = vertices;
     partition->processes = processes;
     partition->seed = seed;
+    partition->long_row_fraction = long_row_fraction;
     if (matrix_partition_choose_grid(processes, requested_rows, requested_cols,
                                      &partition->process_rows,
                                      &partition->process_cols)) return 1;
-    if (!matrix_partition_is_gp_or_hp(mode)) {
+    if (!matrix_partition_uses_explicit_map(mode)) {
         if (mode == MATRIX_PARTITION_1D_RANDOM ||
             mode == MATRIX_PARTITION_2D_RANDOM) {
             partition->local_indices =
@@ -400,15 +522,21 @@ int matrix_partition_prepare(MatrixPartition *partition,
                                               processes, partition->parts);
         } else if (!root_matrix || root_matrix->rows != vertices ||
                    root_matrix->cols != vertices) {
-            fprintf(stderr, "GP/HP partitioning requires a square root matrix\n");
+            fprintf(stderr,
+                    "GP/HP/LRA partitioning requires a square root matrix\n");
             local_error = 1;
         } else if (mode == MATRIX_PARTITION_1D_GP ||
                    mode == MATRIX_PARTITION_2D_GP) {
             local_error = build_graph_partition(root_matrix, processes,
                                                 partition->parts);
-        } else {
+        } else if (mode == MATRIX_PARTITION_1D_HP ||
+                   mode == MATRIX_PARTITION_2D_HP) {
             local_error = build_hypergraph_partition(root_matrix, processes,
                                                      partition->parts);
+        } else {
+            local_error = build_long_row_aware_partition(
+                root_matrix, processes, long_row_fraction,
+                partition->parts);
         }
     }
     int any_error = 0;
@@ -440,6 +568,24 @@ int matrix_partition_prepare(MatrixPartition *partition,
     }
     free(counts);
     return 0;
+}
+
+int matrix_partition_prepare(MatrixPartition *partition,
+                             MatrixPartitionMode mode,
+                             int vertices,
+                             int processes,
+                             int requested_rows,
+                             int requested_cols,
+                             unsigned long long seed,
+                             const char *partition_file,
+                             const COO_Matrix *root_matrix,
+                             int root,
+                             MPI_Comm comm) {
+    return matrix_partition_prepare_with_long_row_fraction(
+        partition, mode, vertices, processes, requested_rows,
+        requested_cols, seed,
+        MATRIX_PARTITION_DEFAULT_LONG_ROW_FRACTION, partition_file,
+        root_matrix, root, comm);
 }
 
 int matrix_partition_vertex_owner(const MatrixPartition *partition,
