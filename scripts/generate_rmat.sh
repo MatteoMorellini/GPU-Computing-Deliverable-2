@@ -14,6 +14,20 @@ set -euo pipefail
 REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
 
+# The generator is built from the Graph500 reference sources, which live in an
+# uninitialised submodule in a fresh clone.
+if [[ ! -r graph500/generator/graph_generator.c ]]; then
+    git submodule update --init --recursive graph500 ||
+        {
+            echo "Populate graph500/ first:" >&2
+            echo "  git clone https://github.com/graph500/graph500 graph500" >&2
+            exit 1
+        }
+fi
+
+make rmat
+mkdir -p matrices
+
 # rmat_22: approximately 38M expanded NNZ
 ./bin/generate_rmat \
     --scale 22 \

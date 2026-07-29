@@ -30,6 +30,11 @@ if [[ ! -r "$NCCL_ROOT/lib/libnccl.so" ]]; then
 fi
 export LD_LIBRARY_PATH="$NCCL_ROOT/lib:${LD_LIBRARY_PATH:-}"
 
+# Build an NCCL-enabled executable so this launcher works from an empty bin/.
+# -B is required because bin/mpi_spmv_cuda has the same name in both build
+# configurations, so a stale NCCL=0 binary would otherwise look up to date.
+make -B NCCL=1 NCCL_ROOT="$NCCL_ROOT" bin/mpi_spmv_cuda
+
 REPS="${1:-50}"
 WARMUP="${2:-5}"
 OUTPUT="${3:-results/nccl.csv}"

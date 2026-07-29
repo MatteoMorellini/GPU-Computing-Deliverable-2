@@ -38,6 +38,45 @@ Computations on Large Scale-Free Graphs Using 2D Graph Partitioning*.
   common runner interface and selectable CUDA/cuSPARSE kernel implementations.
 - `matrices/tiny.mtx` - small input file for smoke testing.
 
+## Get the Matrices First
+
+`matrices/` is not tracked by git, so a fresh clone has no input at all. Every
+benchmark except the weak-scaling one scans `matrices/` for `.mtx` files and
+exits with `No .mtx files found in ./matrices/` when it is empty, so download
+the inputs before submitting anything.
+
+The seven SuiteSparse matrices are fetched with:
+
+```bash
+scripts/download_matrices.sh
+```
+
+Run it on a node with outbound internet access - on most clusters the login
+node, not a compute node. It is not a batch script. Downloads resume and
+completed matrices are skipped, so it is safe to re-run after an interruption.
+Fetch a subset by name when you only need part of the set:
+
+```bash
+scripts/download_matrices.sh eu-2005 rajat31
+```
+
+| Matrix | SuiteSparse group | Archive |
+| --- | --- | --- |
+| `webbase-1M` | Williams | 11 MB |
+| `eu-2005` | LAW | 46 MB |
+| `Si41Ge41H72` | PARSEC | 70 MB |
+| `rajat31` | Rajat | 79 MB |
+| `FullChip` | Freescale | 123 MB |
+| `nlpkkt240` | Schenk | 1.3 GB |
+| `webbase-2001` | LAW | 2.5 GB |
+
+Matrix Market text expands roughly sixfold on extraction, so `nlpkkt240` and
+`webbase-2001` together need tens of GB of free space. `KEEP_ARCHIVES=1`
+retains the `.tar.gz` files, which are otherwise deleted after extraction.
+
+The R-MAT inputs are not on SuiteSparse and are generated locally instead; see
+[Graph500 R-MAT Matrix Generation](#graph500-r-mat-matrix-generation).
+
 ## Build
 
 From this directory:
@@ -82,14 +121,17 @@ If your environment exposes a different MPI module, load the one that provides
 ## Graph500 R-MAT Matrix Generation
 
 The R-MAT utility uses the official Graph500 generator with its fixed
-initiator probabilities `a=0.57`, `b=0.19`, `c=0.19`, and `d=0.05`. Clone the
-reference implementation once next to this project's `Makefile`, then build
-the standalone utility:
+initiator probabilities `a=0.57`, `b=0.19`, `c=0.19`, and `d=0.05`. The
+reference implementation is a submodule; populate it once, then build the
+standalone utility:
 
 ```bash
-git clone https://github.com/graph500/graph500 graph500
+git submodule update --init graph500
 make rmat
 ```
+
+`scripts/generate_rmat.sh` performs both steps itself, so it can be submitted
+from a fresh clone.
 
 Generation is chunked and therefore does not hold the complete edge-tuple list
 in memory. The default seeds are Graph500's `2` and `3`, duplicate/parallel
@@ -205,7 +247,8 @@ Submit the communication analysis for every matrix with:
 sbatch scripts/communication_volume_run.sh
 ```
 
-Run the MPI SpMV benchmark across every `.mtx` file in `matrices/`:
+Run the MPI SpMV benchmark across every `.mtx` file in `matrices/`, which
+assumes `scripts/download_matrices.sh` has already populated it:
 
 ```bash
 module load CUDA/12.3.2
@@ -238,9 +281,9 @@ directory is empty.
 Other script controls are `PARTITION_SEED`, `PARTITION_FILE`,
 `LONG_ROW_FRACTION`, `INPUT_MODE`, `KERNEL`, and `CUDA_AWARE_MPI=0|1`.
 
-For the NCCL communication backend, build with `make NCCL=1` and submit the
-separate NCCL launcher. It configures the NCCL library path for binaries built
-without an embedded runtime path:
+For the NCCL communication backend, submit the separate NCCL launcher. It
+rebuilds `bin/mpi_spmv_cuda` with `NCCL=1` and configures the NCCL library
+path:
 
 ```bash
 sbatch scripts/MPI_run_nccl.sh
@@ -248,8 +291,8 @@ sbatch scripts/MPI_run_nccl.sh
 
 When the cluster does not export `EBROOTNCCL`, pass its root at submission:
 `NCCL_ROOT=/path/to/nccl sbatch scripts/MPI_run_nccl.sh`. Optionally set
-`NCCL_MODULE` to load a site-specific NCCL module. Rebuild with `make clean &&
-make NCCL=0` before returning to `scripts/MPI_run.sh`.
+`NCCL_MODULE` to load a site-specific NCCL module. Both launchers force a
+rebuild, so they can be alternated without a manual `make clean`.
 
 For an LRA-only batch run:
 
@@ -509,7 +552,8 @@ sbatch --export=ALL,ROWS_PER_GPU=524288,NNZ_PER_ROW=48,REPS=100 \
 The defaults are 262144 rows per GPU, 32 nonzeros per row, 5 warm-ups, 50
 measured repetitions, seed 20260721, the adaptive kernel, block-distributed
 vectors, and CUDA-aware MPI. Set `CUDA_AWARE_MPI=0` for host staging or
-`NCCL=1` for NCCL device exchange. Extra
+`NCCL=1` for NCCL device exchange; the script rebuilds
+`bin/mpi_spmv_cuda_weak` in the matching configuration. Extra
 command-line options passed to the script are appended to the executable
 arguments and therefore override these defaults.
 

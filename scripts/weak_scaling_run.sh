@@ -16,6 +16,9 @@ cd "$REPO_ROOT"
 
 module load CUDA/12.3.2
 module load OpenMpi/4.1.5-CUDA-12.3.2
+# bin/mpi_spmv_cuda_weak links the shared partitioners, so libmetis.so must be
+# resolvable at run time even though the weak-scaling driver never calls METIS.
+module load METIS/5.1.0-GCCcore-12.3.0
 
 ROWS_PER_GPU="${ROWS_PER_GPU:-262144}"
 NNZ_PER_ROW="${NNZ_PER_ROW:-32}"
@@ -29,9 +32,22 @@ VALIDATION_MAX_ROWS="${VALIDATION_MAX_ROWS:-65536}"
 CUDA_AWARE_MPI="${CUDA_AWARE_MPI:-1}"
 NCCL="${NCCL:-0}"
 
-if [[ "$NCCL" == "1" && -n "${NCCL_MODULE:-}" ]]; then
-    module load "$NCCL_MODULE"
+if [[ "$NCCL" == "1" ]]; then
+    if [[ -n "${NCCL_MODULE:-}" ]]; then
+        module load "$NCCL_MODULE"
+    fi
+    NCCL_ROOT="${NCCL_ROOT:-${EBROOTNCCL:-}}"
+    if [[ -z "$NCCL_ROOT" || ! -r "$NCCL_ROOT/lib/libnccl.so" ]]; then
+        echo "NCCL library not found under NCCL_ROOT=${NCCL_ROOT:-<unset>}" >&2
+        exit 1
+    fi
+    export LD_LIBRARY_PATH="$NCCL_ROOT/lib:${LD_LIBRARY_PATH:-}"
+    export NCCL_ROOT
 fi
+
+# Build the weak-scaling executable so this launcher works from an empty bin/.
+# -B is required because both NCCL configurations produce the same file name.
+make -B NCCL="$NCCL" bin/mpi_spmv_cuda_weak
 
 mkdir -p results
 RUN_ID="${SLURM_JOB_ID:-$$}"
